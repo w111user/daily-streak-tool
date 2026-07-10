@@ -44,7 +44,7 @@ playwright install chromium
 
 ### 2. Cấu hình `config.json`
 
-Tạo file `config.json` từ mẫu `config.example.json`:
+Tạo file `config.json` từ mẫu `config.example`:
 
 ```json
 {
