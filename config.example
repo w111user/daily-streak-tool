@@ -1,0 +1,31 @@
+{
+  "schedule": {
+    "time": "00:00",
+    "timezone": "Asia/Ho_Chi_Minh",
+    "run_on_start": true
+  },
+  "cookie_file": "cookies.json",
+  "tiktok": {
+    "headless": false,
+    "user_data_dir_linux": "~/chrome-debug",
+    "user_data_dir_macos": "~/Library/Application Support/chrome-debug",
+    "user_data_dir_windows": "~\\AppData\\Local\\chrome-debug",
+    "message_delay_seconds": [8, 18],
+    "navigation_timeout_ms": 60000
+  },
+  "recipients": [
+    {
+      "name": "Tên hiển thị",
+      "username": "username_tiktok"
+    }
+  ],
+  "videos": [
+    "https://www.tiktok.com/@username/video/VIDEO_ID",
+    "https://vt.tiktok.com/VIDEO_ID"
+  ],
+  "telegram": {
+    "enabled": false,
+    "bot_token": "PASTE_BOT_TOKEN_HERE",
+    "chat_id": "PASTE_CHAT_ID_HERE"
+  }
+}

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Project sensitive files
+cookies.json
+config.json
+
+# Backup files
+*_backup.py
+debugger.py
+gooning.txt
+
+# Chrome profile
+browser-profile/
+chrome-debug/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
