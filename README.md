@@ -9,7 +9,8 @@ Tự động gửi video TikTok hàng ngày đến danh sách bạn bè để du
 - Hỗ trợ đa nền tảng: Linux, Windows, macOS
 - Lên lịch gửi tự động hàng ngày theo giờ cố định
 - Inject cookie từ file (không cần login lại mỗi lần)
-- Tự động xử lý CAPTCHA, Screen Time popup, Sleep Hours popup
+- Tự động xử lý Screen Time popup, Sleep Hours popup
+- Tuy nhiên, người dùng cần phải tự tay xử lý captcha
 
 ## Yêu cầu
 
