@@ -99,3 +99,7 @@ python3 main.py
 - `cookies.json` hết hạn sau vài tháng → cần export lại
 - Không commit `cookies.json` và `config.json` lên GitHub
 - Giữ process chạy liên tục để scheduler hoạt động (dùng `tmux` hoặc `screen` trên Linux)
+
+> ⚠️ **Disclaimer:** This project is for educational purposes only. 
+> Automated interaction with TikTok may violate their Terms of Service.
+> Use at your own risk.
