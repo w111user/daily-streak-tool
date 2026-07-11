@@ -22,8 +22,8 @@ Tự động gửi video TikTok hàng ngày đến danh sách bạn bè để du
 
 ```bash
 # Clone repo
-git clone https://github.com/w111user/tiktok-automatic-sender
-cd tiktok-automatic-sender
+git clone https://github.com/w111user/daily-streak-tool
+cd daily-streak-tool
 
 # Tạo virtual environment
 python3 -m venv .venv
