@@ -26,6 +26,24 @@ def get_chrome_path() -> str:
     return "/usr/bin/google-chrome"
 
 
+def get_default_user_data_dir() -> str:
+    system = platform.system()
+    if system == "Windows":
+        return str(Path.home() / "AppData/Local/chrome-debug")
+    if system == "Darwin":
+        return str(Path.home() / "Library/Application Support/chrome-debug")
+    return str(Path.home() / ".config/chrome-debug")
+
+
+def get_user_data_dir_key() -> str:
+    system = platform.system()
+    if system == "Windows":
+        return "user_data_dir_windows"
+    if system == "Darwin":
+        return "user_data_dir_macos"
+    return "user_data_dir_linux"
+
+
 def log_duration(step: str, start_time: float) -> None:
     logger.info("%s took %.2fs", step, time.time() - start_time)
 
@@ -55,7 +73,10 @@ class TikTokSender:
             return
 
         async with async_playwright() as playwright:
-            user_data_dir = Path(self.tiktok_config.get("user_data_dir", "/run/media/w11user/GooningData/chrome-debug"))
+            key = get_user_data_dir_key()
+            user_data_dir = Path(
+                self.tiktok_config.get(key) or get_default_user_data_dir()
+            ).expanduser()
             context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(user_data_dir),
                 executable_path=get_chrome_path(),

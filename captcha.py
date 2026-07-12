@@ -81,7 +81,10 @@ async def handle_screen_time_popup(page: Page) -> None:
 
 async def handle_sleep_hours_popup(page: Page) -> None:
     try:
-        btn = page.locator("button.e1gebsw611")
+        btn = page.locator(
+            "button:has-text('Return for now'),"
+            "button:has-text('Quay lại')"
+        ).first
         await btn.wait_for(state="visible", timeout=2000)
         await btn.click()
         await page.wait_for_timeout(1000)

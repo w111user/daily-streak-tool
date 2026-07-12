@@ -29,6 +29,15 @@ def get_default_user_data_dir() -> str:
     return str(Path.home() / ".config/chrome-debug")
 
 
+def get_user_data_dir_key() -> str:
+    system = platform.system()
+    if system == "Windows":
+        return "user_data_dir_windows"
+    if system == "Darwin":
+        return "user_data_dir_macos"
+    return "user_data_dir_linux"
+
+
 class AsyncRunner:
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
@@ -218,12 +227,10 @@ class StreakSenderUI:
 
     async def scan_dm_list_async(self) -> list[dict[str, str]]:
         async with async_playwright() as playwright:
+            key = get_user_data_dir_key()
             user_data_dir = Path(
-                self.config.get("tiktok", {}).get(
-                    "user_data_dir",
-                    get_default_user_data_dir(),
-                )
-            )
+                self.config.get("tiktok", {}).get(key) or get_default_user_data_dir()
+            ).expanduser()
             context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(user_data_dir),
                 executable_path=get_chrome_path(),
@@ -310,12 +317,10 @@ class StreakSenderUI:
 
     async def resolve_usernames_async(self, recipients: list[dict[str, str]]) -> list[dict[str, str]]:
         async with async_playwright() as playwright:
+            key = get_user_data_dir_key()
             user_data_dir = Path(
-                self.config.get("tiktok", {}).get(
-                    "user_data_dir",
-                    get_default_user_data_dir(),
-                )
-            )
+                self.config.get("tiktok", {}).get(key) or get_default_user_data_dir()
+            ).expanduser()
             context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(user_data_dir),
                 executable_path=get_chrome_path(),
