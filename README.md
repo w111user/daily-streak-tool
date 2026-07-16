@@ -10,7 +10,7 @@ Tự động gửi video TikTok hàng ngày đến danh sách bạn bè để du
 - Lên lịch gửi tự động hàng ngày theo giờ cố định
 - Inject cookie từ file (không cần login lại mỗi lần)
 - Tự động xử lý Screen Time popup, Sleep Hours popup
-- Tuy nhiên, người dùng cần phải tự tay xử lý captcha (nhớ refresh trang có captcha sau khi giải để ứng dụng tiếp tục khởi chạy các bước)
+- Tuy nhiên, người dùng cần phải tự tay xử lý captcha khi trang yêu cầu.
 
 ## Yêu cầu
 
