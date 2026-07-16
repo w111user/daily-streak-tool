@@ -30,7 +30,7 @@ CAPTCHA_SELECTOR_MARKERS = (
 async def is_captcha_present(page: Page) -> bool:
     for selector in CAPTCHA_SELECTOR_MARKERS:
         try:
-            if await page.locator(selector).first.count() > 0:
+            if await page.locator(selector).first.is_visible():
                 return True
         except Exception:
             logger.debug("CAPTCHA selector check failed: %s", selector, exc_info=True)

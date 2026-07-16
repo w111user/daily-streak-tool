@@ -44,6 +44,53 @@ def get_user_data_dir_key() -> str:
     return "user_data_dir_linux"
 
 
+def check_cookies_valid(cookie_file: str | Path) -> bool:
+    cookie_path = Path(cookie_file)
+    if not cookie_path.exists():
+        return False
+
+    try:
+        with cookie_path.open("r", encoding="utf-8") as file:
+            cookies = json.load(file)
+    except Exception:
+        logger.exception("Failed to load cookies from %s", cookie_path)
+        return False
+
+    for cookie in cookies:
+        if cookie.get("name") != "sessionid":
+            continue
+
+        expires = cookie.get("expires", cookie.get("expirationDate"))
+        if expires is None:
+            return False
+
+        try:
+            return time.time() < float(expires)
+        except (TypeError, ValueError):
+            logger.warning("Invalid sessionid expiry timestamp in %s: %r", cookie_path, expires)
+            return False
+
+    return False
+
+
+def show_cookie_warning_if_ui_running() -> None:
+    try:
+        import tkinter
+        from tkinter import messagebox
+
+        root = tkinter._default_root
+        if root:
+            root.after(
+                0,
+                lambda: messagebox.showwarning(
+                    "Cookies expired",
+                    "Cookies expired or invalid. Please re-export from EditThisCookie.",
+                ),
+            )
+    except Exception:
+        logger.debug("Could not show cookie expiry warning in UI", exc_info=True)
+
+
 def log_duration(step: str, start_time: float) -> None:
     logger.info("%s took %.2fs", step, time.time() - start_time)
 
@@ -70,6 +117,12 @@ class TikTokSender:
     async def send_daily_links(self) -> None:
         if not self.recipients:
             logger.warning("No recipients configured.")
+            return
+
+        cookie_file = self.config.get("cookie_file", "cookies.json")
+        if not check_cookies_valid(cookie_file):
+            logger.error("Cookies expired or invalid. Please re-export from EditThisCookie.")
+            show_cookie_warning_if_ui_running()
             return
 
         async with async_playwright() as playwright:
@@ -182,7 +235,15 @@ class TikTokSender:
             logger.warning("Skipping %s because username is missing.", name)
             return
 
-        video_link = self.video_pool.random_video()
+        videos = [
+            video.strip()
+            for video in self.config.get("videos", [])
+            if isinstance(video, str) and video.strip()
+        ]
+        if not videos:
+            raise ValueError("No videos configured. Add links to the 'videos' list in config.json.")
+        video_link = random.choice(videos)
+        logger.info("Selected video for %s (@%s): %s", name, username, video_link)
         page = await timed_await(f"new page for @{username}", context.new_page())
         try:
             total_start = time.time()

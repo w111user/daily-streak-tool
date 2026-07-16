@@ -12,7 +12,7 @@ from playwright.async_api import BrowserContext, TimeoutError as PlaywrightTimeo
 
 from captcha import handle_screen_time_popup
 from notifier import Notifier
-from sender import TikTokSender, get_chrome_path
+from sender import TikTokSender, check_cookies_valid, get_chrome_path
 from video_pool import VideoPool
 
 
@@ -453,6 +453,14 @@ class StreakSenderUI:
                 return
 
             self.save_config()
+            if not check_cookies_valid(self.config.get("cookie_file", "cookies.json")):
+                messagebox.showwarning(
+                    "Cookies expired",
+                    "Cookies expired or invalid. Please re-export from EditThisCookie.",
+                )
+                self.status.set("Cookies expired or invalid")
+                return
+
             notifier = Notifier(self.config)
             video_pool = VideoPool(self.config)
             sender = TikTokSender(self.config, notifier, video_pool)
