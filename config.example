@@ -11,7 +11,19 @@
     "user_data_dir_macos": "~/Library/Application Support/chrome-debug",
     "user_data_dir_windows": "~\\AppData\\Local\\chrome-debug",
     "message_delay_seconds": [8, 18],
-    "navigation_timeout_ms": 60000
+    "navigation_timeout_ms": 60000,
+    "action_timeout_ms": 10000,
+    "content_ready_timeout_ms": 45000,
+    "dm_readiness_timeout_ms": 45000,
+    "dm_load_attempts": 2,
+    "probe_timeout_ms": 750,
+    "low_memory_mode": false,
+    "low_memory_stabilization_seconds": 4.0,
+    "persistent_context": true,
+    "recipient_retries": 1
+  },
+  "runtime": {
+    "run_lock_stale_seconds": 21600
   },
   "recipients": [
     {

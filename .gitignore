@@ -10,6 +10,10 @@ venv/
 # Project sensitive files
 cookies.json
 config.json
+cookies-*.json
+storage-state.json
+storage-state-*.json
+playwright/.auth/
 
 # Backup files
 *_backup.py
@@ -19,6 +23,14 @@ gooning.txt
 # Chrome profile
 browser-profile/
 chrome-debug/
+browser-profile*/
+chrome-debug*/
+
+# Local runtime data and package artifacts
+daily-streak-data/
+.daily-streak/
+build/
+dist/
 
 # OS
 .DS_Store

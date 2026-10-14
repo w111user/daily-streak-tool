@@ -1,0 +1,3 @@
+"""Shared core components for Daily Streak Tool v2."""
+
+__version__ = "2.0.0"

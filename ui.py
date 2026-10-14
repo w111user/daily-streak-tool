@@ -1,41 +1,33 @@
 import asyncio
-import json
 import logging
-import platform
 import threading
-from pathlib import Path
 from tkinter import BooleanVar, Button, Checkbutton, Entry, Frame, Label, StringVar, Text, Tk, messagebox
 from tkinter import Canvas, Scrollbar
 from typing import Any
 
-from playwright.async_api import BrowserContext, TimeoutError as PlaywrightTimeoutError, async_playwright
+from playwright.async_api import async_playwright
 
-from captcha import handle_screen_time_popup
+from daily_streak.browser import (
+    check_cookies_valid,
+    get_action_timeout_ms,
+    get_content_ready_timeout_ms,
+    get_dm_load_attempts,
+    get_dm_readiness_timeout_ms,
+    get_low_memory_mode,
+    get_low_memory_stabilization_seconds,
+    get_navigation_timeout_ms,
+    get_probe_timeout_ms,
+    launch_browser_session,
+)
+from daily_streak.config import DEFAULT_CONFIG_PATH, load_config, save_config as save_config_file
+from daily_streak.recipients import RecipientService
 from notifier import Notifier
-from sender import TikTokSender, check_cookies_valid, get_chrome_path
+from sender import TikTokSender
 from video_pool import VideoPool
 
 
-CONFIG_PATH = Path("config.json")
+CONFIG_PATH = DEFAULT_CONFIG_PATH
 logger = logging.getLogger(__name__)
-
-
-def get_default_user_data_dir() -> str:
-    system = platform.system()
-    if system == "Windows":
-        return str(Path.home() / "AppData/Local/chrome-debug")
-    if system == "Darwin":
-        return str(Path.home() / "Library/Application Support/chrome-debug")
-    return str(Path.home() / ".config/chrome-debug")
-
-
-def get_user_data_dir_key() -> str:
-    system = platform.system()
-    if system == "Windows":
-        return "user_data_dir_windows"
-    if system == "Darwin":
-        return "user_data_dir_macos"
-    return "user_data_dir_linux"
 
 
 class AsyncRunner:
@@ -61,9 +53,20 @@ class StreakSenderUI:
         self.scan_future: asyncio.Future | None = None
         self.resolve_future: asyncio.Future | None = None
         self.save_after_id: str | None = None
-        self.recipient_vars: list[tuple[BooleanVar, dict[str, str]]] = []
-
         self.config = self.load_config()
+        self.recipient_vars: list[tuple[BooleanVar, dict[str, str]]] = []
+        self.recipient_service = RecipientService(
+            navigation_timeout_ms=get_navigation_timeout_ms(self.config),
+            action_timeout_ms=get_action_timeout_ms(self.config),
+            content_ready_timeout_ms=get_content_ready_timeout_ms(self.config),
+            dm_readiness_timeout_ms=get_dm_readiness_timeout_ms(self.config),
+            dm_load_attempts=get_dm_load_attempts(self.config),
+            probe_timeout_ms=get_probe_timeout_ms(self.config),
+            low_memory_mode=get_low_memory_mode(self.config),
+            low_memory_stabilization_seconds=get_low_memory_stabilization_seconds(
+                self.config
+            ),
+        )
         self.schedule_time = StringVar(value=self.config.get("schedule", {}).get("time", "00:00"))
         delay = self.config.get("tiktok", {}).get("message_delay_seconds", [8, 18])
         self.delay_min = StringVar(value=str(delay[0] if len(delay) > 0 else 8))
@@ -75,17 +78,7 @@ class StreakSenderUI:
         self.bind_autosave()
 
     def load_config(self) -> dict[str, Any]:
-        if not CONFIG_PATH.exists():
-            return {
-                "schedule": {"time": "00:00", "timezone": "Asia/Ho_Chi_Minh", "run_on_start": True},
-                "cookie_file": "cookies.json",
-                "tiktok": {"message_delay_seconds": [8, 18]},
-                "recipients": [],
-                "videos": [],
-            }
-
-        with CONFIG_PATH.open("r", encoding="utf-8") as file:
-            return json.load(file)
+        return load_config(CONFIG_PATH, missing_ok=True)
 
     def build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -169,8 +162,7 @@ class StreakSenderUI:
                 self.config["recipients"] = [
                     recipient for checked, recipient in self.recipient_vars if checked.get()
                 ]
-            with CONFIG_PATH.open("w", encoding="utf-8") as file:
-                json.dump(self.config, file, indent=2)
+            save_config_file(self.config, CONFIG_PATH)
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
 
@@ -227,57 +219,13 @@ class StreakSenderUI:
 
     async def scan_dm_list_async(self) -> list[dict[str, str]]:
         async with async_playwright() as playwright:
-            key = get_user_data_dir_key()
-            user_data_dir = Path(
-                self.config.get("tiktok", {}).get(key) or get_default_user_data_dir()
-            ).expanduser()
-            context = await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(user_data_dir),
-                executable_path=get_chrome_path(),
-                headless=False,
-                args=[
-                    "--restore-last-session",
-                    "--disable-session-crashed-bubble",
-                    "--hide-crash-restore-bubble",
-                ],
-                ignore_default_args=["--enable-automation", "--no-first-run"],
-            )
-            context.set_default_timeout(int(self.config.get("tiktok", {}).get("navigation_timeout_ms", 60000)))
+            session = await launch_browser_session(playwright, self.config)
             try:
-                await self.load_cookies(context)
-                page = context.pages[0] if context.pages else await context.new_page()
-                await page.goto("https://www.tiktok.com/messages", wait_until="domcontentloaded")
-                await handle_screen_time_popup(page)
-
-                conversation_list = page.locator("[data-e2e='dm-new-conversation-list']").first
-                conversation_items = page.locator("[data-e2e='dm-new-conversation-item']")
-                await conversation_items.first.wait_for(state="visible")
-
-                found: dict[str, dict[str, str]] = {}
-                previous_count = -1
-                stable_scrolls = 0
-                for _ in range(40):
-                    count = await conversation_items.count()
-                    for index in range(count):
-                        item = conversation_items.nth(index)
-                        name = await item.locator("[data-e2e='dm-new-conversation-nickname']").inner_text()
-                        name = name.strip()
-                        found[name] = {"name": name, "username": ""}
-
-                    if len(found) == previous_count:
-                        stable_scrolls += 1
-                    else:
-                        stable_scrolls = 0
-                    if stable_scrolls >= 3:
-                        break
-
-                    previous_count = len(found)
-                    await conversation_list.evaluate("(element) => element.scrollBy(0, 600)")
-                    await page.wait_for_timeout(500)
-
-                return list(found.values())
+                await session.load_cookies(self.config.get("cookie_file", "cookies.json"))
+                page = await session.get_page()
+                return await self.recipient_service.scan_dm_list(page)
             finally:
-                await context.close()
+                await session.close()
 
     def resolve_usernames(self) -> None:
         checked_recipients = [
@@ -317,126 +265,19 @@ class StreakSenderUI:
 
     async def resolve_usernames_async(self, recipients: list[dict[str, str]]) -> list[dict[str, str]]:
         async with async_playwright() as playwright:
-            key = get_user_data_dir_key()
-            user_data_dir = Path(
-                self.config.get("tiktok", {}).get(key) or get_default_user_data_dir()
-            ).expanduser()
-            context = await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(user_data_dir),
-                executable_path=get_chrome_path(),
-                headless=False,
-                args=[
-                    "--restore-last-session",
-                    "--disable-session-crashed-bubble",
-                    "--hide-crash-restore-bubble",
-                ],
-                ignore_default_args=["--enable-automation", "--no-first-run"],
-            )
-            context.set_default_timeout(int(self.config.get("tiktok", {}).get("navigation_timeout_ms", 60000)))
+            session = await launch_browser_session(playwright, self.config)
             try:
-                await self.load_cookies(context)
-                page = context.pages[0] if context.pages else await context.new_page()
-                await page.goto("https://www.tiktok.com/messages", wait_until="domcontentloaded")
-                await handle_screen_time_popup(page)
-
-                resolved = []
-                total = len(recipients)
-                for index, recipient in enumerate(recipients, start=1):
-                    self.set_status_from_worker(f"Resolving {index}/{total}...")
-                    display_name = recipient["name"]
-                    await self.click_conversation_by_display_name(page, display_name)
-                    username = await self.extract_username_from_chat(page)
-                    if not username:
-                        logger.warning("Skipping %s because username could not be resolved", display_name)
-                        await page.goto("https://www.tiktok.com/messages", wait_until="domcontentloaded")
-                        await handle_screen_time_popup(page)
-                        continue
-                    resolved.append({"name": display_name, "username": username})
-                    logger.info("Resolved %s to @%s", display_name, username)
-                    await page.goto("https://www.tiktok.com/messages", wait_until="domcontentloaded")
-                    await handle_screen_time_popup(page)
-                return resolved
+                await session.load_cookies(self.config.get("cookie_file", "cookies.json"))
+                page = await session.get_page()
+                return await self.recipient_service.resolve_usernames(
+                    page,
+                    recipients,
+                    on_progress=lambda index, total: self.set_status_from_worker(
+                        f"Resolving {index}/{total}..."
+                    ),
+                )
             finally:
-                await context.close()
-
-    async def click_conversation_by_display_name(self, page: Any, display_name: str) -> None:
-        conversation_list = page.locator("[data-e2e='dm-new-conversation-list']").first
-        conversation_items = page.locator("[data-e2e='dm-new-conversation-item']")
-        await conversation_items.first.wait_for(state="visible")
-
-        normalized_display_name = display_name.casefold()
-        for _ in range(40):
-            for index in range(await conversation_items.count()):
-                item = conversation_items.nth(index)
-                nickname = item.locator("[data-e2e='dm-new-conversation-nickname']")
-                nickname_text = (await nickname.inner_text()).strip()
-                if nickname_text.casefold() == normalized_display_name:
-                    await item.click()
-                    await handle_screen_time_popup(page)
-                    await page.wait_for_timeout(500)
-                    return
-
-            await conversation_list.evaluate("(element) => element.scrollBy(0, 600)")
-            await page.wait_for_timeout(500)
-
-        raise ValueError(f"Could not find conversation for display name: {display_name}")
-
-    async def extract_username_from_chat(self, page: Any) -> str:
-        element = page.locator("[data-e2e='chat-uniqueid']").first
-        try:
-            await element.wait_for(state="visible", timeout=5000)
-        except PlaywrightTimeoutError:
-            logger.warning("Timed out waiting for chat unique id")
-            return ""
-
-        username_text = await element.inner_text()
-        return username_text.strip().lstrip("@")
-
-    async def extract_username_from_item(self, item: Any, fallback: str) -> str:
-        hrefs = await item.locator("a[href^='/@'], a[href*='tiktok.com/@']").evaluate_all(
-            """(links) => links.map((link) => link.getAttribute("href"))"""
-        )
-        for href in hrefs:
-            username = self.username_from_href(href)
-            if username:
-                return username
-        return fallback
-
-    def username_from_href(self, href: str | None) -> str:
-        if not href or "/@" not in href:
-            return ""
-        return href.split("/@")[-1].split("?")[0].split("/")[0].strip().lstrip("@")
-
-    async def load_cookies(self, context: BrowserContext) -> bool:
-        cookie_file = Path(self.config.get("cookie_file", "cookies.json"))
-        if not cookie_file.exists():
-            return False
-
-        with cookie_file.open("r", encoding="utf-8") as file:
-            cookies = json.load(file)
-        if any("expirationDate" in cookie for cookie in cookies):
-            same_site_map = {
-                "unspecified": "None",
-                "no_restriction": "None",
-                "lax": "Lax",
-                "strict": "Strict",
-            }
-            cookies = [
-                {
-                    "name": cookie["name"],
-                    "value": cookie["value"],
-                    "domain": cookie["domain"],
-                    "path": cookie.get("path", "/"),
-                    "expires": int(cookie["expirationDate"]),
-                    "httpOnly": cookie.get("httpOnly", False),
-                    "secure": cookie.get("secure", False),
-                    "sameSite": same_site_map.get(cookie.get("sameSite", "unspecified"), "None"),
-                }
-                for cookie in cookies
-                if not cookie.get("session", False)
-            ]
-        await context.add_cookies(cookies)
-        return True
+                await session.close()
 
     def start_sender(self) -> None:
         try:

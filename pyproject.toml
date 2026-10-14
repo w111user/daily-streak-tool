@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daily-streak-tool"
+version = "2.0.0"
+description = "TikTok daily streak sender with shared desktop and server foundations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "APScheduler>=3.10.4",
+  "playwright>=1.45.0",
+]
+
+[project.optional-dependencies]
+desktop = [
+  "plyer>=2.1.0",
+]
+telegram = [
+  "python-telegram-bot>=21.0",
+]
+tui = [
+  "textual>=0.58",
+]
+windows = [
+  "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.scripts]
+streak = "daily_streak.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["daily_streak*"]
