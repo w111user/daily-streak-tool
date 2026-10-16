@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daily-streak-tool"
-version = "2.0.0"
+version = "2.1.0"
 description = "TikTok daily streak sender with shared desktop and server foundations"
 readme = "README.md"
 requires-python = ">=3.10"

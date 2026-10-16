@@ -75,22 +75,40 @@ class DaemonRunner:
         sender_factory: SenderFactory = create_sender,
         lock: DaemonLock | None = None,
         notifier_factory: Callable[[Mapping[str, Any]], Any] | None = None,
+        pause_store: Any | None = None,
     ) -> None:
         self.config_path = Path(config_path)
         self.config_loader = config_loader
         self.sender_factory = sender_factory
         self.lock = lock
         self.notifier_factory = notifier_factory
+        self.pause_store = pause_store
         self._run_guard = asyncio.Lock()
 
-    async def run_once(self) -> RunSummary | None:
+    async def run_once(self, *, check_pause: bool = True) -> RunSummary | None:
         """Load fresh configuration and run one batch unless a batch is active."""
 
         if self._run_guard.locked():
             logger.warning("Skipping scheduled run because a prior run is still active.")
             return None
+
         async with self._run_guard:
             config = self.config_loader(self.config_path)
+            if check_pause:
+                data_dir = get_data_dir(config)
+                store = self.pause_store
+                if store is None:
+                    from daily_streak.state import PauseStore
+                    store = PauseStore(data_dir)
+                if store.is_paused():
+                    info = store.get_pause_info()
+                    logger.info(
+                        "Skipping scheduled run because daemon scheduler is paused (paused_at: %s, reason: %s)",
+                        info.get("paused_at"),
+                        info.get("reason"),
+                    )
+                    return None
+
             sender = self.sender_factory(config)
             summary = await sender.send_daily_links()
             logger.info(
@@ -100,6 +118,7 @@ class DaemonRunner:
                 summary.unconfirmed_count,
                 summary.skipped_count,
             )
+
             if summary is not None:
                 notifier = None
                 if self.notifier_factory is not None:
@@ -240,9 +259,22 @@ class DaemonManager:
 
         log_path = data_dir / DAEMON_LOG_FILENAME
 
+        from daily_streak.state import PauseStore
+        pause_store = PauseStore(data_dir)
+        pause_info = pause_store.get_pause_info()
+        is_paused = bool(pause_info.get("paused"))
+
+        status_text = "Running" if is_running else "Stopped"
+        if is_running and is_paused:
+            status_text = "Running (Paused)"
+        elif not is_running and is_paused:
+            status_text = "Stopped (Paused)"
+
         return {
-            "status": "Running" if is_running else "Stopped",
+            "status": status_text,
             "is_running": is_running,
+            "is_paused": is_paused,
+            "pause_info": pause_info,
             "pid": pid if is_running else None,
             "schedule_time": schedule.time_text,
             "timezone": str(schedule.timezone),

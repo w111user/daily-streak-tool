@@ -103,6 +103,16 @@ class RunLock:
         except Exception:
             logger.exception("Could not release sender run lock at %s", self.path)
 
+    def read_metadata(self) -> dict[str, Any]:
+        """Read serialized metadata from the run lock file."""
+        return self._read_metadata()
+
+    def is_active(self) -> bool:
+        """Check if a send run lock is currently held by a live process."""
+        if not self.path.exists():
+            return False
+        return not self._is_stale()
+
     def __enter__(self) -> "RunLock":
         self.acquire()
         return self

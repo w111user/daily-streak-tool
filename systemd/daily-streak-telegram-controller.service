@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily Streak Tool - Telegram Remote Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.config/daily-streak-tool
+ExecStart=%h/.venvs/streak/bin/streak --config %h/.config/daily-streak-tool/config.json telegram-controller
+Restart=always
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

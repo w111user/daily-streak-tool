@@ -2,7 +2,7 @@
   "schedule": {
     "time": "00:00",
     "timezone": "Asia/Ho_Chi_Minh",
-    "run_on_start": true
+    "run_on_start": false
   },
   "cookie_file": "cookies.json",
   "tiktok": {
@@ -38,6 +38,12 @@
   "telegram": {
     "enabled": false,
     "bot_token": "PASTE_BOT_TOKEN_HERE",
-    "chat_id": "PASTE_CHAT_ID_HERE"
+    "chat_id": "PASTE_CHAT_ID_HERE",
+    "commands_enabled": false
+  },
+  "daemon": {
+    "service_backend": "process",
+    "systemd_service": "daily-streak-daemon.service",
+    "systemd_scope": "user"
   }
 }

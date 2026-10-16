@@ -212,3 +212,61 @@ class DailyStateStore:
             logger.warning("Preserved malformed daily state at %s", backup_path)
         except Exception:
             logger.exception("Could not preserve malformed daily state at %s", self.path)
+
+
+PAUSE_FILENAME = "daemon-pause.json"
+
+
+class PauseStore:
+    """Persists daemon pause state atomically across processes and restarts."""
+
+    def __init__(self, data_dir: str | Path) -> None:
+        self.data_dir = Path(data_dir)
+        self.path = self.data_dir / PAUSE_FILENAME
+
+    def is_paused(self) -> bool:
+        """Return True if daemon automated runs are currently paused."""
+        info = self.get_pause_info()
+        return bool(info.get("paused"))
+
+    def get_pause_info(self) -> dict[str, Any]:
+        """Return structured pause metadata or default unpaused state."""
+        if not self.path.exists():
+            return {"paused": False}
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                value = json.load(file)
+            if isinstance(value, dict) and bool(value.get("paused")):
+                return {
+                    "paused": True,
+                    "paused_at": value.get("paused_at"),
+                    "reason": value.get("reason"),
+                }
+        except Exception as exc:
+            logger.warning("Failed to read pause state at %s: %s", self.path, exc)
+        return {"paused": False}
+
+    def pause(self, reason: str = "telegram") -> None:
+        """Atomically persist pause state."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "version": 1,
+            "paused": True,
+            "paused_at": now_iso,
+            "reason": str(reason),
+        }
+        atomic_write_json(self.path, payload)
+        logger.info("Daemon scheduler paused (reason=%s)", reason)
+
+    def resume(self) -> bool:
+        """Atomically clear pause state. Return True if was paused."""
+        was_paused = self.is_paused()
+        if self.path.exists():
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                logger.warning("Failed to remove pause file %s: %s", self.path, exc)
+        logger.info("Daemon scheduler resumed")
+        return was_paused

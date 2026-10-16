@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
 
     commands.add_parser("tui", help="Run the optional interactive Textual frontend")
+    commands.add_parser("telegram-controller", help="Run the independent Telegram remote controller")
 
     recipients = commands.add_parser("recipients", help="Inspect or discover DM recipients")
     recipient_commands = recipients.add_subparsers(dest="recipient_command", required=True)
@@ -182,6 +183,8 @@ def run_cli(
             except TuiUnavailableError as exc:
                 _write_error(stderr, str(exc))
                 return EXIT_RUNTIME
+        if arguments.command == "telegram-controller":
+            return asyncio.run(_run_telegram_controller(config_path, stderr, sender_factory))
     except FileNotFoundError as exc:
         _write_error(stderr, f"Configuration error: {exc}")
         return EXIT_CONFIGURATION
@@ -271,6 +274,64 @@ async def _run_daemon(config_path: Path, sender_factory: SenderFactory | None) -
     except DaemonLockedError as exc:
         logger.error(str(exc))
         return EXIT_RUNTIME
+    return EXIT_OK
+
+
+async def _run_telegram_controller(
+    config_path: Path,
+    stderr: TextIO,
+    sender_factory: SenderFactory | None,
+) -> int:
+    try:
+        import telegram
+        import telegram.ext
+    except ImportError:
+        _write_error(
+            stderr,
+            "Error: python-telegram-bot is required to run the Telegram remote controller.\n"
+            "Install the telegram extra using:\n"
+            "  pip install 'daily-streak-tool[telegram]'\n"
+            "or (from wheel):\n"
+            "  pip install '<wheel-path>[telegram]'",
+        )
+        return EXIT_RUNTIME
+
+    config = load_config(config_path)
+    raw_telegram = config.get("telegram", {})
+    telegram_cfg: Mapping[str, Any] = (
+        raw_telegram if isinstance(raw_telegram, Mapping) else {}
+    )
+
+    if not bool(telegram_cfg.get("enabled")):
+        _write_error(
+            stderr,
+            "Configuration error: 'telegram.enabled' is false in config.json.\n"
+            "Set 'telegram.enabled: true' to run the Telegram remote controller.",
+        )
+        return EXIT_CONFIGURATION
+
+    if not telegram_cfg.get("bot_token") or not telegram_cfg.get("chat_id"):
+        _write_error(
+            stderr,
+            "Configuration error: 'telegram.bot_token' and 'telegram.chat_id' must be configured in config.json.",
+        )
+        return EXIT_CONFIGURATION
+
+    if not bool(telegram_cfg.get("commands_enabled")):
+        _write_error(
+            stderr,
+            "Configuration error: Telegram remote commands are disabled.\n"
+            "Set 'telegram.commands_enabled: true' in config.json to enable remote control.",
+        )
+        return EXIT_CONFIGURATION
+
+    from daily_streak.telegram_controller import TelegramController
+
+    controller = TelegramController(
+        config_path,
+        sender_factory=sender_factory or _default_sender_factory(),
+    )
+    await controller.run_forever()
     return EXIT_OK
 
 

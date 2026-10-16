@@ -3,7 +3,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Playwright](https://img.shields.io/badge/playwright-chromium-green.svg)](https://playwright.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
-[![Tests: 158 Passed](https://img.shields.io/badge/tests-158%20passed-brightgreen.svg)](tests/)
+[![Tests: 189 Passed](https://img.shields.io/badge/tests-189%20passed-brightgreen.svg)](tests/)
+
 
 **Daily Streak Tool v2** là công cụ tự động hóa gửi video TikTok trực tiếp qua Direct Message (DM) theo lịch trình để duy trì chuỗi tương tác (streaks) với bạn bè.
 
@@ -11,6 +12,7 @@ Phiên bản 2 (v2) được tái cấu trúc toàn diện thành kiến trúc m
 - **CLI (`streak`)**: Kiểm tra hệ thống, quét DM, resolve username, và gửi batch tin cậy trên môi trường server.
 - **Textual TUI (`streak tui`)**: Giao diện terminal trực quan qua SSH, tích hợp điều khiển daemon, quản lý danh sách người nhận và live logs.
 - **Foreground & Detached Daemon**: Chạy lịch trình tự động với cross-process lock an toàn, tự động nạp cấu hình mới.
+- **Telegram Remote Controller (`streak telegram-controller`)**: Tiến trình điều khiển từ xa độc lập qua Telegram Bot, hỗ trợ tra cứu trạng thái, tạm dừng/tiếp tục lịch gửi, và kích hoạt gửi thủ công kèm bàn phím xác nhận an toàn.
 - **Xác thực gửi thực tế (Delivery Verification)**: Kiểm tra tin nhắn chiều đi (outgoing bubble) thực sự xuất hiện trong DOM trò chuyện thay vì suy đoán từ phím Enter.
 - **Telegram Notifications**: Thông báo trạng thái đăng nhập, cảnh báo CAPTCHA, và tổng kết kết quả batch tự động.
 - **Giao diện Desktop cũ (`ui.py`)**: Giữ nguyên khả năng tương thích với desktop Tkinter.
@@ -32,10 +34,11 @@ Phiên bản 2 (v2) được tái cấu trúc toàn diện thành kiến trúc m
 11. [Vận hành Daemon / Daemon Lifecycle & Supervision](#11-vận-hành-daemon--daemon-lifecycle--supervision)
 12. [Cơ chế xác thực gửi tin / Delivery Verification](#12-cơ-chế-xác-thực-gửi-tin--delivery-verification)
 13. [Thông báo Telegram & Desktop / Notifications](#13-thông-báo-telegram--desktop--notifications)
-14. [Quản lý trạng thái & Lịch sử / State & History](#14-quản-lý-trạng-thái--lịch-sử--state--history)
-15. [Phát triển & Kiểm thử / Development & Testing](#15-phát-triển--kiểm-thử--development--testing)
-16. [Xử lý sự cố & Bảo mật / Troubleshooting & Security](#16-xử-lý-sự-cố--bảo-mật--troubleshooting--security)
-17. [Điều khoản sử dụng / Disclaimer](#17-điều-khoản-sử-dụng--disclaimer)
+14. [Điều khiển từ xa qua Telegram / Telegram Remote Controller](#14-điều-khiển-từ-xa-qua-telegram--telegram-remote-controller)
+15. [Quản lý trạng thái & Lịch sử / State & History](#15-quản-lý-trạng-thái--lịch-sử--state--history)
+16. [Phát triển & Kiểm thử / Development & Testing](#16-phát-triển--kiểm-thử--development--testing)
+17. [Xử lý sự cố & Bảo mật / Troubleshooting & Security](#17-xử-lý-sự-cố--bảo-mật--troubleshooting--security)
+18. [Điều khoản sử dụng / Disclaimer](#18-điều-khoản-sử-dụng--disclaimer)
 
 ---
 
@@ -44,10 +47,12 @@ Phiên bản 2 (v2) được tái cấu trúc toàn diện thành kiến trúc m
 - **Xác thực gửi tin nhắn chiều đi (Bounded Outgoing Verification)**: Chỉ ghi nhận thành công khi quan sát thấy video ID hoặc link gửi đi xuất hiện trong bong bóng chat của người gửi.
 - **Tiếp tục gửi an toàn sau sự cố (Interruption-Safe Daily Resume)**: Tự động lưu tiến độ sau mỗi người nhận; nếu tiến trình bị dừng giữa chừng, lần chạy tiếp theo trong cùng ngày sẽ bỏ qua những người đã nhận thành công.
 - **Phân tách lỗi độc lập (Per-Recipient Isolation & Retries)**: Một người nhận bị lỗi không làm dừng cả batch; hỗ trợ cấu hình số lần retry trước khi đánh dấu thất bại.
-- **Quản lý khóa đa tiến trình (Cross-Process Run Lock)**: Tránh xung đột gửi trùng lặp giữa CLI, TUI và Daemon bằng khóa độc quyền trong thư mục dữ liệu người dùng.
+- **Quản lý khóa đa tiến trình (Cross-Process Run Lock)**: Tránh xung đột gửi trùng lặp giữa CLI, TUI, Telegram Controller và Daemon bằng khóa độc quyền trong thư mục dữ liệu người dùng.
+- **Telegram Remote Controller độc lập**: Nhận lệnh điều khiển từ xa an toàn (`/status`, `/start`, `/stop`, `/pause`, `/resume`, `/run` với inline keyboard confirmation 60s, `/last`, `/next`) chạy như một service độc lập trên Linux server.
 - **Tùy chọn hiển thị đa dạng**: Headed (mở cửa sổ trực quan), Headless (chạy ngầm không giao diện), và hỗ trợ Xvfb trên Linux server.
 - **Tiết kiệm tài nguyên (Low-Memory Mode & Ephemeral Context)**: Tùy chọn chặn tải ảnh/video/font và dọn dẹp browser context ngay sau khi hoàn thành thao tác.
 - **Thông báo tổng kết Telegram tự động**: Gửi báo cáo kết quả chi tiết (Success / Failed / Unconfirmed / Skipped) ngay sau khi batch Daemon hoặc manual TUI Send/Force Send hoàn thành.
+
 
 ---
 
@@ -134,9 +139,12 @@ pip install -e '.[tui,telegram,desktop]'
 
 > **Chi tiết các optional extras trong `pyproject.toml`:**
 > - `tui`: Cài đặt `textual>=0.58` để dùng lệnh `streak tui`.
-> - `telegram`: Cài đặt `python-telegram-bot>=21.0` để gửi thông báo Telegram.
+> - `telegram`: Cài đặt `python-telegram-bot>=21.0` để gửi thông báo Telegram và chạy Telegram Remote Controller.
 > - `desktop`: Cài đặt `plyer>=2.1.0` để hiển thị popup thông báo trên desktop.
 > - `windows`: Cài đặt `pywin32>=306` (chỉ dành cho hệ điều hành Windows).
+>
+> 💡 **Về `requirements.txt` và `pyproject.toml`:** Dự án tuân thủ chuẩn PEP 517/621, sử dụng `pyproject.toml` làm nguồn chân lý duy nhất (single source of truth) cho các dependency và extras. File `requirements.txt` được giữ lại nhằm đảm bảo tương thích ngược với các workflow cài đặt truyền thống (`pip install -r requirements.txt`). Khuyến nghị dùng `pip install -e '.[tui,telegram]'` cho các môi trường phát triển mã nguồn, hoặc `pip install "./daily_streak_tool-2.1.0-py3-none-any.whl[telegram]"` khi triển khai wheel trên server độc lập.
+
 
 ### Bước 3: Cài đặt trình duyệt cho Playwright (nếu không dùng Chrome hệ thống)
 
@@ -223,9 +231,14 @@ cp config.example config.json
 | **`videos`** | `list[string]` | `[]` | Danh sách link video TikTok dùng để chia sẻ ngẫu nhiên. |
 | **`telegram.enabled`** | `boolean` | `false` | Bật/tắt thông báo Telegram. |
 | **`telegram.bot_token`** | `string` | `""` | Bot token nhận từ `@BotFather`. |
-| **`telegram.chat_id`** | `string` | `""` | ID chat hoặc ID nhóm nhận thông báo. |
+| **`telegram.chat_id`** | `string` | `""` | ID chat hoặc ID nhóm nhận thông báo và điều khiển. |
+| **`telegram.commands_enabled`** | `boolean` | `false` | Bật tính năng nhận lệnh điều khiển từ xa qua Telegram Remote Controller. |
+| **`daemon.service_backend`** | `string` | `"process"` | Backend quản lý daemon: `"process"` (tiến trình nền độc lập) hoặc `"systemd"` (dịch vụ systemd). |
+| **`daemon.systemd_service`** | `string` | `"daily-streak-daemon.service"` | Tên systemd unit khi dùng backend systemd. |
+| **`daemon.systemd_scope`** | `string` | `"user"` | Phạm vi systemd: `"user"` (chạy dưới quyền user hiện tại, không cần sudo) hoặc `"system"`. |
 
 ---
+
 
 ## 8. Hướng dẫn bắt đầu nhanh / Quick Start
 
@@ -322,8 +335,11 @@ streak [--config <path>] [--verbose] <command> [options]
   - `streak daemon`: Chạy daemon lập lịch ở chế độ foreground.
   - `streak daemon --status`: Kiểm tra daemon đang chạy hay đã dừng (kèm PID nếu có).
   - `streak daemon --stop`: Gửi tín hiệu dừng an toàn tới daemon đang chạy ngầm.
+- **`streak telegram-controller`**:
+  Khởi chạy tiến trình Telegram Remote Controller độc lập ở chế độ long-polling để nhận lệnh điều khiển từ xa từ tài khoản Telegram được ủy quyền.
 
 ---
+
 
 ## 10. Giao diện dòng lệnh TUI / Textual TUI Reference
 
@@ -334,12 +350,12 @@ streak --config config.json tui
 ```
 
 ### Các Tab chức năng:
-1. **Dashboard**: Hiển thị tổng quan cấu hình, múi giờ, số người hoàn thành hôm nay, trạng thái browser và kết quả đợt gửi vừa qua.
-2. **Results**: Bảng chi tiết kết quả từng người nhận (Trạng thái, số lần thử, video đã chọn, chi tiết lỗi nếu có).
-3. **Recipients**: Danh sách người nhận kèm checkbox chọn/bỏ chọn trực tiếp. Thao tác chọn được lưu ngay lập tức vào `config.json`.
-4. **Videos**: Danh sách video trong pool.
-5. **History**: Bảng nhật ký lịch sử các lần chạy trước.
-6. **Daemon**: Quản lý daemon ngầm: trạng thái PID, lịch gửi tiếp theo, nút Start / Stop / Refresh daemon, và khung xem 100 dòng log daemon gần nhất.
+1. **Dashboard**: Hiển thị tổng quan cấu hình, múi giờ, số người hoàn thành hôm nay, trạng thái browser, và bảng kết quả chi tiết từng người nhận (kết quả đợt gửi gần nhất).
+2. **Recipients**: Danh sách người nhận kèm checkbox chọn/bỏ chọn trực tiếp. Thao tác chọn được lưu ngay lập tức vào `config.json`.
+3. **Videos**: Danh sách video trong pool.
+4. **History**: Bảng nhật ký lịch sử các lần chạy trước.
+5. **Daemon**: Quản lý daemon ngầm: trạng thái PID, lịch gửi tiếp theo, nút Start / Stop / Refresh daemon, và khung xem 100 dòng log daemon gần nhất.
+
 
 ### Phím tắt (Keyboard Shortcuts):
 
@@ -384,32 +400,41 @@ Daemon chịu trách nhiệm chạy các đợt gửi tự động theo giờ đ
 - **`send.lock`**: Khóa thực thi phiên gửi tin. Khi daemon hoặc người dùng đang gửi tin nhắn, bất kỳ lệnh `send` nào khác phát sinh đồng thời sẽ bị từ chối ngay lập tức để tránh tranh chấp trình duyệt.
 
 ### Vấn đề khởi động lại máy chủ (Reboot Persistence):
-> ℹ️ **LƯU Ý:** Tiến trình daemon chạy ngầm **không thể tự khởi động lại sau khi reboot máy chủ** nếu không có trình quản lý tiến trình.
-> Trên môi trường production, hãy cấu hình một dịch vụ `systemd` đơn giản:
+> ℹ️ **LƯU Ý:** Tiến trình daemon chạy ngầm bằng `streak daemon --detach` **không thể tự khởi động lại sau khi reboot máy chủ** nếu không có trình quản lý tiến trình của hệ điều hành.
+> Trên Linux (Debian/Ubuntu), khuyến nghị sử dụng **systemd user service** (chạy dưới quyền user thường, không cần quyền root hay `sudo`).
 
-```ini
-# /etc/systemd/system/daily-streak.service
-[Unit]
-Description=Daily Streak Tool Daemon
-After=network.target
+Dự án cung cấp sẵn template `systemd/daily-streak-daemon.service`.
 
-[Service]
-Type=simple
-User=your_username
-WorkingDirectory=/path/to/daily-streak-tool
-ExecStart=/path/to/daily-streak-tool/.venv/bin/streak --config config.json daemon
-Restart=on-failure
-RestartSec=30
+#### 1. Chọn layout triển khai:
+- **Layout A — Production (Mặc định trong template):**
+  Dành cho môi trường cài package trong virtualenv tập trung:
+  - Executable: `~/.venvs/streak/bin/streak` (specifier `%h/.venvs/streak/bin/streak`)
+  - Thư mục làm việc & Config: `~/.config/daily-streak-tool/config.json`
+- **Layout B — Source checkout (Nhà phát triển / Clone repo):**
+  Nếu bạn clone repo về máy (ví dụ `~/daily-streak-tool`) và tạo virtualenv cục bộ:
+  - Thay đổi đường dẫn trong file service thành:
+    - `WorkingDirectory=%h/daily-streak-tool`
+    - `ExecStart=%h/daily-streak-tool/.venv/bin/streak --config %h/daily-streak-tool/config.json daemon`
 
-[Install]
-WantedBy=multi-user.target
-```
-
-Kích hoạt service:
+#### 2. Kích hoạt service:
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now daily-streak.service
+# 1. Tạo thư mục systemd user nếu chưa có
+mkdir -p ~/.config/systemd/user
+
+# 2. Copy file daemon service vào thư mục user và phân quyền chuẩn
+cp systemd/daily-streak-daemon.service ~/.config/systemd/user/
+chmod 644 ~/.config/systemd/user/daily-streak-daemon.service
+
+# 3. Kích hoạt User Lingering (để service tự chạy khi boot và không bị tắt khi logout SSH)
+loginctl enable-linger $USER
+
+# 4. Nạp lại systemd và kích hoạt service
+systemctl --user daemon-reload
+systemctl --user enable --now daily-streak-daemon.service
 ```
+
+> ⚠️ **CHÚ Ý VỀ `schedule.run_on_start`:** Khi daemon khởi động, nếu `config.json` có `"run_on_start": true`, hệ thống sẽ **gửi tin nhắn TikTok ngay lập tức** cho các người nhận chưa hoàn thành trong ngày thay vì đợi đến giờ hẹn. Hãy kiểm tra kỹ giá trị này trước khi bật service.
+> 💡 **Mẹo:** Nếu bạn sử dụng cả tính năng **Telegram Remote Controller** để điều khiển từ xa, hãy xem hướng dẫn thiết lập trọn bộ 2 service tại [Mục 14](#14-điều-khiển-từ-xa-qua-telegram--telegram-remote-controller).
 
 ---
 
@@ -436,10 +461,14 @@ Sau khi submit tin nhắn, hệ thống theo dõi danh sách DOM trò chuyện t
 
 ## 13. Thông báo Telegram & Desktop / Notifications
 
-Khi cài đặt extra `.[telegram]`, bạn có thể nhận thông báo tức thời về tình trạng hoạt động của công cụ:
+Khi cài đặt extra `telegram`, bạn có thể nhận thông báo tức thời về tình trạng hoạt động của công cụ:
 
 ```bash
+# Khi cài từ mã nguồn:
 pip install -e '.[telegram]'
+
+# Hoặc khi cài đặt từ file wheel (.whl) trên máy chủ:
+pip install "./daily_streak_tool-2.1.0-py3-none-any.whl[telegram]"
 ```
 
 ### Các sự kiện gửi thông báo:
@@ -463,7 +492,101 @@ Skipped: 0
 
 ---
 
-## 14. Quản lý trạng thái & Lịch sử / State & History
+## 14. Điều khiển từ xa qua Telegram / Telegram Remote Controller
+
+Phiên bản v2 bổ sung **Telegram Remote Controller** độc lập (`streak telegram-controller`), cho phép bạn quản lý, theo dõi và kích hoạt các đợt gửi tin nhắn trực tiếp từ ứng dụng Telegram trên điện thoại mà không cần mở terminal SSH.
+
+### Kiến trúc & Nguyên tắc thiết kế:
+- **Tiến trình độc lập (Decoupled Process)**: Controller và TikTok sender daemon là 2 process riêng biệt. Controller vẫn duy trì kết nối long-polling để nhận lệnh kể cả khi daemon đang tắt, tạm dừng hoặc khởi động lại.
+- **Bảo mật tuyệt đối (Zero-Trust Authorization)**: Chỉ chấp nhận tin nhắn và tương tác từ đúng `telegram.chat_id` đã cấu hình. Mọi lệnh, tin nhắn hoặc nút bấm từ tài khoản/nhóm khác đều bị **âm thầm bỏ qua** và ghi cảnh báo bảo mật.
+- **An toàn mặc định (Opt-in Control)**: Tính năng điều khiển từ xa chỉ hoạt động khi bạn đặt `"commands_enabled": true` trong `config.json`. Nếu trường này là `false`, controller sẽ từ chối khởi động để phòng ngừa thao tác ngoài ý muốn.
+- **Không lộ thông tin nhạy cảm (Secret Hygiene)**: Tuyệt đối không log bot token, cookies hoặc thông tin xác thực ra stdout, log files hay Telegram chat.
+
+### Bảng lệnh Telegram:
+
+| Lệnh / Command | Chức năng / Action | Chi tiết & Cơ chế an toàn |
+| :--- | :--- | :--- |
+| **`/help`** | Hướng dẫn sử dụng | Hiển thị danh sách đầy đủ các lệnh khả dụng và mô tả chức năng. |
+| **`/status`** | Kiểm tra trạng thái hệ thống | Hiển thị trạng thái daemon (Running/Stopped/Paused kèm PID), backend (`systemd` hoặc `process`), tiến độ gửi hôm nay (`X/Y`), số video trong pool, lịch chạy tiếp theo, và trạng thái khóa `send.lock`. *(Hoạt động kể cả khi daemon đang tắt)*. |
+| **`/last`** | Xem lượt chạy gần nhất | Đọc dữ liệu từ `history.jsonl`, hiển thị thời điểm hoàn tất, loại đợt gửi, thời gian thực thi (giây), và số lượng chi tiết (`Success`, `Failed`, `Unconfirmed`, `Skipped`). *(Hoạt động kể cả khi daemon đang tắt)*. |
+| **`/next`** | Xem lịch gửi kế tiếp | Tính toán thời gian và đếm ngược (giờ, phút) tới đợt gửi tự động tiếp theo theo múi giờ cấu hình. Hiển thị cảnh báo nếu scheduler đang bị tạm dừng. |
+| **`/start`** | Khởi động daemon | Gọi backend (`systemctl` hoặc `DaemonManager`) để khởi động daemon ngầm. Đảm bảo idempotent: nếu daemon đã chạy sẽ thông báo PID hiện tại thay vì tạo lỗi. |
+| **`/stop`** | Dừng daemon | Dừng an toàn tiến trình daemon scheduler. |
+| **`/pause`** | Tạm dừng gửi tự động | Lưu trạng thái pause bền vững vào `daemon-pause.json`. Tiến trình daemon vẫn chạy bình thường nhưng scheduler sẽ tự động bỏ qua các lượt gửi cho đến khi bạn resume. |
+| **`/resume`** | Tiếp tục gửi tự động | Hủy trạng thái tạm dừng trong `daemon-pause.json`. Nếu daemon đang tắt, bot sẽ nhắc bạn gửi lệnh `/start` để khởi động lại. |
+| **`/run`** | Gửi thủ công ngay lập tức | Kích hoạt đợt gửi tin nhắn TikTok ngay lập tức kèm bàn phím Inline xác nhận an toàn (xem chi tiết bên dưới). |
+
+### Cơ chế chạy thủ công an toàn (`/run`):
+1. **Kiểm tra khóa trước (`Pre-flight Lock Check`)**: Khi bạn gõ `/run`, controller kiểm tra ngay `send.lock`. Nếu đang có một đợt gửi khác hoạt động, yêu cầu sẽ bị từ chối ngay lập tức.
+2. **Bàn phím Inline xác nhận (Interactive Inline Keyboard)**:
+   - Bot gửi tin nhắn kèm 2 nút bấm: `✅ Xác nhận gửi (Confirm)` và `❌ Hủy (Cancel)`.
+   - **Hết hạn sau 60 giây (60s TTL)**: Nếu sau 60 giây không có tương tác, yêu cầu tự động vô hiệu hóa.
+   - **Chỉ dùng một lần (Single-Consumption)**: Nút bấm chỉ nhận phản hồi một lần duy nhất. Bấm lần hai hoặc click lặp sẽ bị từ chối và thông báo đã xử lý.
+3. **Cập nhật kết quả tự động**: Sau khi đợt gửi hoàn thành, bot gửi đúng một tin nhắn tổng kết chi tiết (`Success`, `Failed`, `Unconfirmed`, `Skipped`) và không gửi thông báo trùng lặp.
+
+### Triển khai Systemd Service trên Linux (Debian 12/13, Ubuntu):
+
+Dự án cung cấp sẵn hai file service unit trong thư mục `systemd/`:
+- `systemd/daily-streak-daemon.service` (quản lý lịch trình gửi tự động)
+- `systemd/daily-streak-telegram-controller.service` (bot nhận lệnh điều khiển từ xa)
+
+Cả hai service đều được thiết kế dưới dạng **systemd user service** (chạy dưới quyền user thường, không cần quyền root hay `sudo`).
+
+#### Hai layout triển khai:
+- **Layout A — Production (Mặc định trong template):**
+  Dành cho môi trường cài package trong virtualenv tập trung:
+  - Executable: `~/.venvs/streak/bin/streak` (`%h/.venvs/streak/bin/streak`)
+  - Config: `~/.config/daily-streak-tool/config.json` (`%h/.config/daily-streak-tool/config.json`)
+  - WorkingDirectory: `~/.config/daily-streak-tool` (`%h/.config/daily-streak-tool`)
+- **Layout B — Source checkout (Dành cho nhà phát triển / Clone repo):**
+  Nếu bạn chạy trực tiếp từ thư mục mã nguồn clone về (ví dụ `~/daily-streak-tool`):
+  - Chỉnh sửa `WorkingDirectory` và `ExecStart` trong cả 2 file `.service` để trỏ vào virtualenv và config cục bộ (ví dụ `WorkingDirectory=%h/daily-streak-tool`, `ExecStart=%h/daily-streak-tool/.venv/bin/streak --config %h/daily-streak-tool/config.json daemon` và `telegram-controller`).
+
+#### Các bước cài đặt:
+```bash
+# 1. Tạo thư mục systemd user nếu chưa có
+mkdir -p ~/.config/systemd/user
+
+# 2. Copy các file service vào thư mục user và phân quyền chuẩn
+cp systemd/*.service ~/.config/systemd/user/
+chmod 644 ~/.config/systemd/user/daily-streak-*.service
+
+# 3. Kích hoạt tính năng User Lingering (đảm bảo user service tiếp tục chạy khi logout SSH)
+loginctl enable-linger $USER
+
+# 4. Nạp lại systemd daemon và kích hoạt cả 2 services
+systemctl --user daemon-reload
+systemctl --user enable --now daily-streak-daemon.service
+systemctl --user enable --now daily-streak-telegram-controller.service
+
+# 5. Kiểm tra trạng thái hoạt động
+systemctl --user status daily-streak-daemon.service
+systemctl --user status daily-streak-telegram-controller.service
+```
+
+> ⚠️ **LƯU Ý:** Nếu `config.json` có `"run_on_start": true`, `daily-streak-daemon.service` sẽ **gửi tin nhắn TikTok ngay khi vừa start**. Nếu không muốn kích hoạt gửi ngay trong lúc cấu hình, hãy đảm bảo đặt `"run_on_start": false` trước khi bật service.
+
+Khi cấu hình `config.json`:
+```json
+{
+  "daemon": {
+    "service_backend": "systemd",
+    "systemd_service": "daily-streak-daemon.service",
+    "systemd_scope": "user"
+  },
+  "telegram": {
+    "enabled": true,
+    "bot_token": "YOUR_BOT_TOKEN",
+    "chat_id": "YOUR_CHAT_ID",
+    "commands_enabled": true
+  }
+}
+```
+Lúc này, lệnh `/start` và `/stop` từ Telegram sẽ gọi trực tiếp `systemctl --user start/stop daily-streak-daemon.service` một cách chuẩn mực và an toàn.
+
+---
+
+## 15. Quản lý trạng thái & Lịch sử / State & History
 
 Để đảm bảo an toàn và không làm bẩn thư mục mã nguồn, toàn bộ dữ liệu trạng thái được lưu mặc định tại thư mục chuẩn của hệ điều hành:
 
@@ -473,6 +596,7 @@ Skipped: 0
 
 ### Các file lưu trữ:
 - `daily_state.json`: Lưu danh sách các username đã nhận video thành công theo ngày (ví dụ `2026-10-15`). Dữ liệu được ghi theo cơ chế atomic write (ghi file tạm rồi đổi tên) để chống hỏng file khi mất điện đột ngột.
+- `daemon-pause.json`: Lưu trạng thái tạm dừng của scheduler (`/pause` và `/resume`).
 - `history.jsonl`: Lưu nhật ký các đợt chạy dưới dạng JSON Lines (mỗi đợt 1 dòng).
 - `send.lock` & `daemon.lock`: Các file khóa quản lý tiến trình.
 - `daemon.log`: File ghi log của daemon khi chạy detached.
@@ -481,7 +605,7 @@ Skipped: 0
 
 ---
 
-## 15. Phát triển & Kiểm thử / Development & Testing
+## 16. Phát triển & Kiểm thử / Development & Testing
 
 Dự án tuân thủ tiêu chuẩn kiểm thử tự động nghiêm ngặt bằng `unittest` chuẩn của Python. Toàn bộ test suite sử dụng mocks/fakes, **không bao giờ mở kết nối mạng thật hoặc tự động hóa tài khoản TikTok thật trong quá trình test**.
 
@@ -491,8 +615,9 @@ Chạy bộ kiểm tra toàn diện:
 # 1. Kiểm tra biên dịch bytecode toàn bộ project
 ./.venv/bin/python -m compileall -q .
 
-# 2. Chạy toàn bộ 158 automated unit tests
+# 2. Chạy toàn bộ 189 automated unit tests
 ./.venv/bin/python -m unittest discover -v
+
 
 # 3. Kiểm tra định dạng git diff và khoảng trắng thừa
 git diff --check
@@ -500,7 +625,7 @@ git diff --check
 
 ---
 
-## 16. Xử lý sự cố & Bảo mật / Troubleshooting & Security
+## 17. Xử lý sự cố & Bảo mật / Troubleshooting & Security
 
 ### 1. Lỗi "Cookies expired or invalid"
 - Cookie TikTok thường hết hạn sau 1 - 3 tháng hoặc khi bạn nhấn Đăng xuất trên trình duyệt máy tính.
@@ -522,7 +647,7 @@ git diff --check
 
 ---
 
-## 17. Điều khoản sử dụng / Disclaimer
+## 18. Điều khoản sử dụng / Disclaimer
 
 > ⚠️ **TUYÊN BỐ MIỄN TRỪ TRÁCH NHIỆM / DISCLAIMER:**
 >
