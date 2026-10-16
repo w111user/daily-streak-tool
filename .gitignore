@@ -19,7 +19,8 @@ playwright/.auth/
 *_backup.py
 debugger.py
 gooning.txt
-AGENTS.md #vibe coder say hello
+# vibe coder say hello
+AGENTS.md 
 # Chrome profile
 browser-profile/
 chrome-debug/
