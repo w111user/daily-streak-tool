@@ -108,3 +108,113 @@ async def resolve_recipients(
         )
 
     return await _run_with_recipient_page(config, resolve)
+
+
+async def refresh_streaks(
+    config: Mapping[str, Any],
+    recipients: Sequence[Mapping[str, Any]],
+    *,
+    force: bool = True,
+    device_id: str | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    reader_factory: Callable[..., Any] | None = None,
+    streak_lock_factory: Callable[[Any], Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Refresh TikTok streak statuses for recipients via standalone API or Android UI reader.
+
+    Updates the shared durable StreakCache and returns structured recipient records.
+    Serialized across processes via StreakLock.
+    """
+
+    if not recipients:
+        return []
+
+    import asyncio
+    from daily_streak.lock import StreakLock
+    from daily_streak.paths import get_data_dir
+    from daily_streak.streak_reader import StreakCache, format_streak_display
+
+    data_dir = get_data_dir(config)
+    cache = StreakCache(data_dir)
+    lock = streak_lock_factory(data_dir) if streak_lock_factory is not None else StreakLock(data_dir)
+    raw_android = config.get("android", {})
+    android_cfg = raw_android if isinstance(raw_android, Mapping) else {}
+    target_device = device_id or android_cfg.get("device_id") or config.get("device_id")
+
+    if reader_factory is not None:
+        reader = reader_factory(cache, target_device)
+    elif device_id is not None or android_cfg.get("use_android"):
+        from daily_streak.android_streak_reader import AndroidAdbClient, AndroidStreakReader
+
+        adb_path = str(android_cfg.get("adb_path") or "adb")
+        adb_client = AndroidAdbClient(device_id=target_device, adb_path=adb_path)
+        reader = AndroidStreakReader(cache, adb_client=adb_client)
+    else:
+        from daily_streak.api_streak_reader import ApiStreakReader
+
+        cookie_file = config.get("cookie_file", "cookies.json")
+        reader = ApiStreakReader(cache, cookie_file=cookie_file)
+
+    def _sync_refresh() -> list[dict[str, Any]]:
+        lock.acquire()
+        try:
+            if hasattr(reader, "refresh_recipients"):
+                records = reader.refresh_recipients(
+                    recipients,
+                    force_refresh=force,
+                    populate_cache=True,
+                    on_progress=on_progress,
+                )
+                results: list[dict[str, Any]] = []
+                for item, record in zip(recipients, records):
+                    name = str(item.get("name") or "").strip()
+                    username = str(item.get("username") or "").strip()
+                    results.append(
+                        {
+                            "name": name,
+                            "username": username,
+                            "streak": record.to_dict(),
+                            "streak_display": format_streak_display(record),
+                        }
+                    )
+                return results
+
+            # Scan visible Android screen once and populate cache
+            items = getattr(reader, "scan_inbox_streaks", lambda **kw: [])(populate_cache=True)
+            results = []
+            total = len(recipients)
+            for index, item in enumerate(recipients, start=1):
+                name = str(item.get("name") or "").strip()
+                username = str(item.get("username") or "").strip()
+                if not username:
+                    results.append(
+                        {
+                            "name": name,
+                            "username": "",
+                            "streak": None,
+                            "streak_display": "Chưa xác định",
+                        }
+                    )
+                    continue
+                record = reader.read_recipient_streak(
+                    username,
+                    display_name=name or None,
+                    force_refresh=force,
+                    items=items,
+                )
+                results.append(
+                    {
+                        "name": name,
+                        "username": username,
+                        "streak": record.to_dict(),
+                        "streak_display": format_streak_display(record),
+                    }
+                )
+                if on_progress is not None:
+                    on_progress(index, total)
+            return results
+        finally:
+            lock.release()
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _sync_refresh)

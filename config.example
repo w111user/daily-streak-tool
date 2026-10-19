@@ -20,7 +20,9 @@
     "low_memory_mode": false,
     "low_memory_stabilization_seconds": 4.0,
     "persistent_context": true,
-    "recipient_retries": 1
+    "recipient_retries": 1,
+    "message_format": "native_video_card",
+    "allow_raw_url_fallback": false
   },
   "runtime": {
     "run_lock_stale_seconds": 21600
@@ -45,5 +47,9 @@
     "service_backend": "process",
     "systemd_service": "daily-streak-daemon.service",
     "systemd_scope": "user"
+  },
+  "android": {
+    "device_id": null,
+    "adb_path": "adb"
   }
 }

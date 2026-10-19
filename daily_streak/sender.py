@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
 import logging
 import random
@@ -33,7 +34,11 @@ from daily_streak.tiktok import (
     handle_sleep_hours_popup,
     wait_for_captcha_if_present,
 )
-from daily_streak.videos import VideoPool
+from daily_streak.videos import (
+    VideoPool,
+    extract_canonical_video_id,
+    resolve_canonical_video,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -44,7 +49,7 @@ class DeliveryVerificationError(RuntimeError):
 
 
 class DeliveryUnconfirmedError(DeliveryVerificationError):
-    """Enter was pressed, but delivery could not be confirmed within the timeout.
+    """Enter or submit was pressed, but delivery could not be confirmed within the timeout.
 
     This outcome is ambiguous; callers must not automatically retry.
     """
@@ -57,15 +62,7 @@ class DeliveryConfirmedNotSentError(DeliveryVerificationError):
 def extract_video_identifier(video_url: str) -> str:
     """Extract a stable video ID or shortcode from a TikTok video URL."""
 
-    cleaned = video_url.strip().split("?")[0].rstrip("/")
-    if "/video/" in cleaned:
-        return cleaned.split("/video/")[-1].split("/")[0]
-    if "vt.tiktok.com/" in cleaned:
-        return cleaned.split("vt.tiktok.com/")[-1].split("/")[0]
-    if "/v/" in cleaned:
-        part = cleaned.split("/v/")[-1].split("/")[0]
-        return part.replace(".html", "")
-    return cleaned
+    return extract_canonical_video_id(video_url)
 
 
 DELIVERY_VERIFICATION_SCRIPT = """
@@ -77,6 +74,27 @@ DELIVERY_VERIFICATION_SCRIPT = """
 
     const startIdx = Math.max(0, Math.min(initialCount, currentCount - 2));
     const candidates = items.slice(startIdx);
+
+    const extractFiberData = (sharedEl) => {
+        if (!sharedEl) return { itemId: null, isMyself: null };
+        const reactKey = Object.keys(sharedEl).find(k => k.startsWith("__reactFiber"));
+        if (!reactKey) return { itemId: null, isMyself: null };
+        let curr = sharedEl[reactKey];
+        let itemId = null;
+        let isMyself = null;
+        for (let d = 0; d < 15 && curr; d++) {
+            if (curr.memoizedProps) {
+                if (curr.memoizedProps.itemId && !itemId) {
+                    itemId = String(curr.memoizedProps.itemId);
+                }
+                if (typeof curr.memoizedProps.isMyself === "boolean" && isMyself === null) {
+                    isMyself = curr.memoizedProps.isMyself;
+                }
+            }
+            curr = curr.return;
+        }
+        return { itemId, isMyself };
+    };
 
     for (let i = candidates.length - 1; i >= 0; i--) {
         const item = candidates[i];
@@ -97,15 +115,42 @@ DELIVERY_VERIFICATION_SCRIPT = """
         const links = Array.from(item.querySelectorAll("a")).map(a => a.href || "");
         const allText = (item.innerText || "") + " " + (item.textContent || "");
 
+        // Native shared video card check
+        if (sharedVideo) {
+            const { itemId, isMyself } = extractFiberData(sharedVideo);
+            if (isMyself === false) {
+                continue;
+            }
+
+            const matchesFiberId = Boolean(
+                expectedVideoId && itemId && (
+                    itemId === expectedVideoId ||
+                    expectedVideoId.includes(itemId) ||
+                    itemId.includes(expectedVideoId)
+                )
+            );
+            const matchesTextId = Boolean(expectedVideoId && allText.includes(expectedVideoId));
+            const matchesUrl = Boolean(expectedUrl && (allText.includes(expectedUrl) || links.some(l => l.includes(expectedUrl))));
+
+            if (matchesFiberId || matchesTextId || matchesUrl || (currentCount > initialCount && !expectedVideoId)) {
+                return {
+                    verified: true,
+                    current_count: currentCount,
+                    matched_by: "native_video_card",
+                    matched_item_id: itemId || expectedVideoId,
+                };
+            }
+        }
+
+        // Raw text / URL link check
         const matchesUrl = Boolean(expectedUrl && (allText.includes(expectedUrl) || links.some(l => l.includes(expectedUrl))));
         const matchesId = Boolean(expectedVideoId && (allText.includes(expectedVideoId) || links.some(l => l.includes(expectedVideoId))));
-        const isNewSharedVideo = Boolean(currentCount > initialCount && sharedVideo);
 
-        if (matchesUrl || matchesId || isNewSharedVideo) {
+        if (matchesUrl || matchesId) {
             return {
                 verified: true,
                 current_count: currentCount,
-                matched_by: matchesUrl ? "url" : (matchesId ? "video_id" : "shared_video_card")
+                matched_by: "raw_url",
             };
         }
     }
@@ -171,6 +216,7 @@ class TikTokSender:
         run_lock: RunLock | None = None,
         on_recipient_result: RecipientResultCallback | None = None,
         now_provider: Callable[[], datetime] | None = None,
+        streak_refresher: Callable[..., Any] | None = None,
     ) -> None:
         self.config = config
         self.notifier = notifier
@@ -178,6 +224,14 @@ class TikTokSender:
         raw_tiktok_config = config.get("tiktok", {})
         self.tiktok_config: Mapping[str, Any] = (
             raw_tiktok_config if isinstance(raw_tiktok_config, Mapping) else {}
+        )
+        self.message_format = (
+            str(self.tiktok_config.get("message_format", "native_video_card"))
+            .strip()
+            .lower()
+        )
+        self.allow_raw_url_fallback = bool(
+            self.tiktok_config.get("allow_raw_url_fallback", False)
         )
         raw_recipients = config.get("recipients", [])
         self.recipients: Sequence[Mapping[str, Any]] = (
@@ -213,6 +267,8 @@ class TikTokSender:
         )
         self.on_recipient_result = on_recipient_result
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
+        self.streak_refresher = streak_refresher
+        self._active_dm_page: Any = None
 
     async def send_daily_links(self, *, force: bool = False) -> RunSummary:
         """Complete session setup, then send every configured recipient once."""
@@ -243,16 +299,42 @@ class TikTokSender:
                     cookies_loaded = await session.load_cookies(cookie_file)
                     page = await session.get_page()
                     await self._ensure_logged_in(page, cookies_loaded=cookies_loaded)
-                    return await self.send_recipients(
+                    summary = await self.send_recipients(
                         session.context,
                         summary,
                         daily_state=daily_state,
                         force=force,
+                        dm_page=page,
                     )
                 finally:
                     await session.close()
+            await self._auto_refresh_streaks(summary)
+            return summary
         finally:
             self.run_lock.release()
+
+    async def _auto_refresh_streaks(self, summary: RunSummary) -> None:
+        """Automatically refresh streaks once after sending if any messages were attempted."""
+        if summary.setup_error:
+            return
+        has_attempts = any(
+            result.status is not RecipientStatus.SKIPPED
+            for result in summary.results
+        )
+        if not has_attempts:
+            logger.debug("No messages were attempted in this batch; skipping post-send streak refresh.")
+            return
+
+        logger.info("Batch attempted sends; automatically refreshing recipient streaks once.")
+        try:
+            if self.streak_refresher is not None:
+                await self.streak_refresher(self.config, self.recipients)
+            else:
+                from daily_streak.recipient_actions import refresh_streaks
+
+                await refresh_streaks(self.config, self.recipients, force=True)
+        except Exception as exc:
+            logger.warning("Post-send automatic streak refresh failed (non-fatal): %s", exc)
 
     async def send_recipients(
         self,
@@ -261,20 +343,48 @@ class TikTokSender:
         *,
         force: bool = False,
         daily_state: DailyState | None = None,
+        dm_page: Any = None,
     ) -> RunSummary:
         """Send recipients sequentially with resume-safe state and history."""
 
         summary = summary if summary is not None else self._new_summary()
         daily_state = daily_state or self._load_daily_state()
-        for recipient in self.recipients:
-            result = self._resume_skip_result(recipient, daily_state, force=force)
-            if result is None:
-                result = await self._send_recipient_with_retries(context, recipient)
-            summary.add_result(result)
-            if result.status is RecipientStatus.SUCCESS:
-                self._persist_success(daily_state, result)
-            self._report_recipient_result(result, summary)
-            await self._sleep_between_messages()
+        self._active_dm_page = dm_page
+        created_dm_page_internally = False
+
+        try:
+            for recipient in self.recipients:
+                result = self._resume_skip_result(recipient, daily_state, force=force)
+                if result is None:
+                    # If active DM page was closed, reset it so next recipient recreates cleanly
+                    if self._active_dm_page is not None and getattr(self._active_dm_page, "is_closed", lambda: False)():
+                        logger.info("Retained DM page was closed; recreating page for next recipient")
+                        self._active_dm_page = None
+
+                    # If no active DM page, try to obtain or create one
+                    if self._active_dm_page is None and callable(getattr(context, "new_page", None)):
+                        pages = getattr(context, "pages", ())
+                        if pages and not getattr(pages[0], "is_closed", lambda: False)():
+                            self._active_dm_page = pages[0]
+                        else:
+                            t_init = time.monotonic()
+                            self._active_dm_page = await context.new_page()
+                            created_dm_page_internally = True
+                            logger.info("Timing: DM page initialization took %.2fs", time.monotonic() - t_init)
+
+                    result = await self._send_recipient_with_retries(context, recipient)
+                summary.add_result(result)
+                if result.status is RecipientStatus.SUCCESS:
+                    self._persist_success(daily_state, result)
+                self._report_recipient_result(result, summary)
+                await self._sleep_between_messages()
+        finally:
+            if created_dm_page_internally and self._active_dm_page is not None:
+                if hasattr(self._active_dm_page, "close") and not getattr(self._active_dm_page, "is_closed", lambda: False)():
+                    with suppress(Exception):
+                        await self._active_dm_page.close()
+            self._active_dm_page = None
+
         return self._finish_run(summary)
 
     async def _ensure_logged_in(self, page: Any, cookies_loaded: bool = False) -> None:
@@ -336,17 +446,25 @@ class TikTokSender:
         last_error: Exception | None = None
         for attempt in range(1, attempts_allowed + 1):
             try:
+                if self._active_dm_page is not None and getattr(self._active_dm_page, "is_closed", lambda: False)():
+                    self._active_dm_page = None
+
                 await self._send_recipient_once(context, recipient, selected_video)
             except DeliveryUnconfirmedError as exc:
-                # Ambiguous delivery: Enter was submitted, but verification timed out.
+                # Ambiguous delivery: Enter or submit was pressed, but verification timed out.
                 # Do NOT automatically retry during the same operation to avoid duplicate sends!
                 logger.warning(
-                    "Delivery unconfirmed on attempt %d for %s (@%s): %s. Will not retry.",
+                    "delivery_unconfirmed: Delivery unconfirmed on attempt %d for %s (@%s): %s. Will not retry.",
                     attempt,
                     recipient_name,
                     username,
                     exc,
                 )
+                if self._active_dm_page is not None:
+                    with suppress(Exception):
+                        if hasattr(self._active_dm_page, "close") and not getattr(self._active_dm_page, "is_closed", lambda: False)():
+                            await self._active_dm_page.close()
+                    self._active_dm_page = None
                 return RecipientResult(
                     recipient_name=recipient_name,
                     username=username,
@@ -358,6 +476,11 @@ class TikTokSender:
                     elapsed_seconds=time.monotonic() - start_time,
                 )
             except asyncio.CancelledError:
+                if self._active_dm_page is not None:
+                    with suppress(Exception):
+                        if hasattr(self._active_dm_page, "close") and not getattr(self._active_dm_page, "is_closed", lambda: False)():
+                            await self._active_dm_page.close()
+                    self._active_dm_page = None
                 raise
             except Exception as exc:
                 last_error = exc
@@ -368,9 +491,15 @@ class TikTokSender:
                     recipient_name,
                     username,
                 )
+                if self._active_dm_page is not None:
+                    with suppress(Exception):
+                        if hasattr(self._active_dm_page, "close") and not getattr(self._active_dm_page, "is_closed", lambda: False)():
+                            await self._active_dm_page.close()
+                    self._active_dm_page = None
             else:
                 logger.info(
-                    "Sent and verified video link to %s (@%s) on attempt %d: %s",
+                    "delivery_verified: Sent and verified %s to %s (@%s) on attempt %d: %s",
+                    self.message_format,
                     recipient_name,
                     username,
                     attempt,
@@ -403,22 +532,344 @@ class TikTokSender:
         context: Any,
         recipient: Mapping[str, Any],
         selected_video: str,
+        *,
+        dm_page: Any = None,
     ) -> None:
         username = str(recipient["username"])
         configured_display_name = str(recipient.get("name") or "").strip()
-        page = await context.new_page()
-        try:
-            page, _ = await self.recipient_service.select_recipient_for_username_with_page(
-                page,
+        target_dm_page = dm_page if dm_page is not None else getattr(self, "_active_dm_page", None)
+
+        if self.message_format == "raw_url":
+            logger.info(
+                "raw_url: Sending video to %s (@%s)",
+                configured_display_name or "recipient",
                 username,
-                self.notifier,
-                configured_display_name=configured_display_name or None,
             )
+            await self._send_raw_url_flow(context, recipient, selected_video, username=username, dm_page=target_dm_page)
+            return
+
+        # Default: native_video_card
+        logger.info(
+            "native_video_card: Sharing video to %s (@%s)",
+            configured_display_name or "recipient",
+            username,
+        )
+        try:
+            await self._send_native_card_flow(context, recipient, selected_video, username=username, dm_page=target_dm_page)
+        except DeliveryConfirmedNotSentError as exc:
+            if self.allow_raw_url_fallback:
+                logger.warning(
+                    "native_video_card: Sharing failed before submit for %s (@%s): %s; falling back to raw_url",
+                    configured_display_name or "recipient",
+                    username,
+                    exc,
+                )
+                await self._send_raw_url_flow(context, recipient, selected_video, username=username, dm_page=target_dm_page)
+            else:
+                raise
+
+    async def _send_native_card_flow(
+        self,
+        context: Any,
+        recipient: Mapping[str, Any],
+        selected_video: str,
+        username: str,
+        *,
+        dm_page: Any = None,
+    ) -> None:
+        configured_display_name = str(recipient.get("name") or "").strip()
+        canonical_url, video_id = resolve_canonical_video(selected_video)
+
+        reused_page = dm_page is not None
+        if not reused_page:
+            t0 = time.monotonic()
+            dm_page = await context.new_page()
+            logger.info("Timing: DM page initialization took %.2fs", time.monotonic() - t0)
+
+        video_page = None
+        try:
+            # 1. Open recipient's DM conversation first to verify recipient and count initial messages
+            t_select = time.monotonic()
+            select_kwargs: dict[str, Any] = {
+                "configured_display_name": configured_display_name or None,
+            }
+            if reused_page:
+                select_kwargs["reuse_existing_page"] = True
+
+            try:
+                dm_page, _ = await self.recipient_service.select_recipient_for_username_with_page(
+                    dm_page,
+                    username,
+                    self.notifier,
+                    **select_kwargs,
+                )
+            except TypeError:
+                select_kwargs.pop("reuse_existing_page", None)
+                dm_page, _ = await self.recipient_service.select_recipient_for_username_with_page(
+                    dm_page,
+                    username,
+                    self.notifier,
+                    **select_kwargs,
+                )
+
+            if reused_page:
+                self._active_dm_page = dm_page
+
+            await self._handle_tiktok_interruptions(dm_page)
+
+            # Verify chat header matches expected recipient
+            extract_fn = getattr(self.recipient_service, "extract_username_from_chat", None)
+            if callable(extract_fn):
+                try:
+                    chat_username = await extract_fn(dm_page)
+                    if chat_username and normalize_username(chat_username) != normalize_username(username):
+                        raise DeliveryConfirmedNotSentError(
+                            f"Opened chat header @{chat_username} does not match expected @{username}"
+                        )
+                except (asyncio.CancelledError, DeliveryConfirmedNotSentError):
+                    raise
+                except Exception as exc:
+                    logger.warning("Could not verify chat header username before sending: %s", exc)
+
+            initial_item_count = await self._count_chat_items(dm_page)
+            logger.info(
+                "Timing: Conversation selection and composer readiness took %.2fs for %s",
+                time.monotonic() - t_select,
+                username,
+            )
+
+            # 2. Open video page in separate page and execute native share
+            t_video = time.monotonic()
+            video_page = await context.new_page()
+            try:
+                await self._share_video_card(
+                    video_page,
+                    recipient=recipient,
+                    canonical_url=canonical_url,
+                    video_id=video_id,
+                )
+            finally:
+                if hasattr(video_page, "close"):
+                    t_cleanup = time.monotonic()
+                    await video_page.close()
+                    logger.info("Timing: Post-send cleanup (closed video page) took %.2fs", time.monotonic() - t_cleanup)
+            logger.info("Timing: Video share operation took %.2fs for %s", time.monotonic() - t_video, username)
+
+            # 3. Verify delivery in the recipient's DM
+            t_delivery = time.monotonic()
+            await self._wait_for_delivery_evidence(
+                dm_page,
+                canonical_url,
+                initial_item_count=initial_item_count,
+                expected_username=username,
+                expected_video_id=video_id,
+            )
+            logger.info("Timing: Delivery verification took %.2fs for %s", time.monotonic() - t_delivery, username)
+            await self._handle_tiktok_interruptions(dm_page)
+        finally:
+            if not reused_page and hasattr(dm_page, "close"):
+                t_close = time.monotonic()
+                await dm_page.close()
+                logger.info("Timing: Post-send cleanup (closed DM page) took %.2fs", time.monotonic() - t_close)
+
+    async def _send_raw_url_flow(
+        self,
+        context: Any,
+        recipient: Mapping[str, Any],
+        selected_video: str,
+        username: str,
+        *,
+        dm_page: Any = None,
+    ) -> None:
+        configured_display_name = str(recipient.get("name") or "").strip()
+        reused_page = dm_page is not None
+        if not reused_page:
+            t0 = time.monotonic()
+            dm_page = await context.new_page()
+            logger.info("Timing: DM page initialization took %.2fs", time.monotonic() - t0)
+
+        page = dm_page
+        try:
+            t_select = time.monotonic()
+            select_kwargs: dict[str, Any] = {
+                "configured_display_name": configured_display_name or None,
+            }
+            if reused_page:
+                select_kwargs["reuse_existing_page"] = True
+
+            try:
+                page, _ = await self.recipient_service.select_recipient_for_username_with_page(
+                    page,
+                    username,
+                    self.notifier,
+                    **select_kwargs,
+                )
+            except TypeError:
+                select_kwargs.pop("reuse_existing_page", None)
+                page, _ = await self.recipient_service.select_recipient_for_username_with_page(
+                    page,
+                    username,
+                    self.notifier,
+                    **select_kwargs,
+                )
+
+            if reused_page:
+                self._active_dm_page = page
+
             await self._handle_tiktok_interruptions(page)
+            logger.info(
+                "Timing: Conversation selection and composer readiness took %.2fs for %s",
+                time.monotonic() - t_select,
+                username,
+            )
+
+            t_send = time.monotonic()
             await self._send_message(page, selected_video, username=username)
+            logger.info("Timing: Video send operation took %.2fs for %s", time.monotonic() - t_send, username)
             await self._handle_tiktok_interruptions(page)
         finally:
-            await page.close()
+            if not reused_page and hasattr(page, "close"):
+                t_close = time.monotonic()
+                await page.close()
+                logger.info("Timing: Post-send cleanup (closed DM page) took %.2fs", time.monotonic() - t_close)
+
+    async def _share_video_card(
+        self,
+        page: Any,
+        recipient: Mapping[str, Any],
+        canonical_url: str,
+        video_id: str,
+    ) -> None:
+        """Open the video page, use TikTok's Share to friends dialog, and click Send.
+
+        Raises:
+            DeliveryConfirmedNotSentError: If the share dialog, search, or
+            selection fails before submission.
+            DeliveryUnconfirmedError: If submission occurred but verification is
+            ambiguous.
+        """
+        username = str(recipient.get("username") or "").lstrip("@")
+        configured_display_name = str(recipient.get("name") or "").strip()
+
+        logger.info(
+            "native_video_card: Navigating to %s to share with %s (@%s)",
+            canonical_url,
+            configured_display_name or "recipient",
+            username,
+        )
+
+        # 1. Navigate to video
+        goto = getattr(page, "goto", None)
+        if callable(goto):
+            try:
+                await page.goto(
+                    canonical_url,
+                    wait_until="commit",
+                    timeout=self.navigation_timeout_ms,
+                )
+            except Exception as exc:
+                raise DeliveryConfirmedNotSentError(
+                    f"Failed to navigate to video page {canonical_url}: {exc}"
+                ) from exc
+
+        await self._handle_tiktok_interruptions(page)
+
+        # 2. Click Share icon button on video
+        locator = getattr(page, "locator", None)
+        if not callable(locator):
+            return
+
+        try:
+            share_btn = page.locator("[data-e2e='share-icon'], [aria-label*='Share' i]").first
+            await share_btn.wait_for(state="visible", timeout=self.action_timeout_ms)
+            await share_btn.click(timeout=self.action_timeout_ms)
+        except Exception as exc:
+            raise DeliveryConfirmedNotSentError(
+                f"Failed to click share button on video page: {exc}"
+            ) from exc
+
+        await self._handle_tiktok_interruptions(page)
+
+        # 3. Switch to 'Send to friends' search view if search navbar button exists
+        try:
+            search_nav_btn = page.locator(
+                ".TUXModalNavBar-leading button, .TUXModal button:has(svg.flip-rtl), .TUXModal .TUXNavBarIconButton"
+            ).first
+            if await search_nav_btn.count() > 0 and await search_nav_btn.is_visible():
+                await search_nav_btn.click(timeout=self.action_timeout_ms)
+        except Exception as exc:
+            logger.debug("Note while opening Send to friends search view: %s", exc)
+
+        # 4. Search for recipient
+        try:
+            search_input = page.locator(
+                ".TUXModal input.TUXTextInputCore-input, .TUXModal input[placeholder*='Search' i]"
+            ).first
+            if await search_input.count() > 0:
+                await search_input.wait_for(state="visible", timeout=self.action_timeout_ms)
+                if hasattr(search_input, "fill"):
+                    await search_input.fill("")
+                if hasattr(search_input, "type"):
+                    await search_input.type(username or configured_display_name)
+                await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.warning(
+                "Could not type into friends search box: %s; checking visible list",
+                exc,
+            )
+
+        # 5. Select recipient row
+        try:
+            containers = page.locator(".TUXModal [class*='DivUserItemContainer']")
+            count = await containers.count()
+            selected = False
+            target_norm = username.lower()
+            target_display = configured_display_name.lower() if configured_display_name else None
+
+            for i in range(count):
+                item = containers.nth(i)
+                text = (await item.inner_text()).lower()
+                if (target_norm and target_norm in text) or (target_display and target_display in text):
+                    await item.click(timeout=self.action_timeout_ms)
+                    selected = True
+                    break
+
+            # Fallback to horizontal share avatars in initial share-group if not found in list
+            if not selected:
+                avatar_btn = page.locator(f".TUXModal [data-e2e='share-{username}']").first
+                if await avatar_btn.count() > 0 and await avatar_btn.is_visible():
+                    await avatar_btn.click(timeout=self.action_timeout_ms)
+                    selected = True
+
+            if not selected:
+                raise DeliveryConfirmedNotSentError(
+                    f"Recipient @{username} ({configured_display_name}) not found in TikTok share friends list."
+                )
+        except DeliveryConfirmedNotSentError:
+            raise
+        except Exception as exc:
+            raise DeliveryConfirmedNotSentError(
+                f"Failed to select recipient in share dialog: {exc}"
+            ) from exc
+
+        # 6. Click Send button
+        try:
+            send_btn = page.locator(
+                ".TUXModal button.TUXButton--primary:has-text('Send'), .TUXModal [class*='StyledSendButton']"
+            ).first
+            await send_btn.wait_for(state="visible", timeout=self.action_timeout_ms)
+            await send_btn.click(timeout=self.action_timeout_ms)
+        except Exception as exc:
+            raise DeliveryConfirmedNotSentError(
+                f"Failed to submit native share Send button: {exc}"
+            ) from exc
+
+        logger.info(
+            "native_video_card: Send button clicked for %s (@%s)",
+            configured_display_name or "recipient",
+            username,
+        )
+        await asyncio.sleep(1.0)
 
     async def _send_message(self, page: Any, message: str, username: str | None = None) -> None:
         """Type and submit a message, then wait for observable evidence of delivery."""
@@ -482,10 +933,11 @@ class TikTokSender:
         *,
         initial_item_count: int,
         expected_username: str | None = None,
+        expected_video_id: str | None = None,
     ) -> None:
         """Poll for observable proof that the outgoing message appeared in the chat."""
 
-        video_id = extract_video_identifier(message)
+        video_id = expected_video_id or extract_video_identifier(message)
         timeout_seconds = self.action_timeout_ms / 1000
         start_time = time.monotonic()
         deadline = start_time + timeout_seconds
@@ -510,11 +962,18 @@ class TikTokSender:
             last_probe_details = probe
             if probe.get("verified"):
                 elapsed = time.monotonic() - start_time
+                matched_by = probe.get("matched_by", "matched")
                 logger.info(
-                    "Delivery verified in %.2fs for %s: outgoing message observed (%s)",
+                    "delivery_verified: Observed %s in %.2fs for %s (matched_by=%s)",
+                    matched_by,
                     elapsed,
                     expected_username or "recipient",
-                    probe.get("matched_by", "matched"),
+                    matched_by,
+                )
+                logger.info(
+                    "Timing: Delivery verification took %.2fs for %s",
+                    elapsed,
+                    expected_username or "recipient",
                 )
                 return
 
@@ -524,7 +983,7 @@ class TikTokSender:
 
         elapsed = time.monotonic() - start_time
         logger.warning(
-            "Delivery verification timed out after %.2fs for %s: "
+            "delivery_unconfirmed: Verification timed out after %.2fs for %s: "
             "initial_items=%d current_items=%s composer_cleared=%s",
             elapsed,
             expected_username or "recipient",
@@ -533,7 +992,7 @@ class TikTokSender:
             last_probe_details.get("composer_cleared", "<unknown>"),
         )
         raise DeliveryUnconfirmedError(
-            f"Enter was submitted, but outgoing message was not observed within {timeout_seconds:.1f}s."
+            f"Submission occurred, but outgoing message was not observed within {timeout_seconds:.1f}s."
         )
 
     async def _probe_outgoing_message(
@@ -596,12 +1055,12 @@ class TikTokSender:
                         is_outgoing = False
 
                 if is_outgoing:
+                    shared = last_item.locator("[data-e2e='dm-new-shared-video']")
+                    if await shared.count() > 0:
+                        return {"verified": True, "current_count": count, "matched_by": "native_video_card"}
                     text = await last_item.inner_text()
                     if (expected_video_id and expected_video_id in text) or (expected_url and expected_url in text):
                         return {"verified": True, "current_count": count, "matched_by": "text"}
-                    shared = last_item.locator("[data-e2e='dm-new-shared-video']")
-                    if await shared.count() > 0:
-                        return {"verified": True, "current_count": count, "matched_by": "shared_video"}
             return {"verified": False, "current_count": count, "composer_cleared": False}
         except Exception:
             return {"verified": False, "current_count": 0, "composer_cleared": False}
@@ -751,4 +1210,13 @@ class TikTokSender:
         if not isinstance(delay_range, list) or len(delay_range) != 2:
             delay_range = [8, 18]
         low, high = sorted(int(value) for value in delay_range)
-        await asyncio.sleep(random.randint(low, high))
+        duration = random.randint(low, high)
+        t0 = time.monotonic()
+        await asyncio.sleep(duration)
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "Timing: Inter-message delay slept for %.2fs (target %ds, range %s)",
+            elapsed,
+            duration,
+            delay_range,
+        )

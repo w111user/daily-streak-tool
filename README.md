@@ -3,7 +3,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Playwright](https://img.shields.io/badge/playwright-chromium-green.svg)](https://playwright.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
-[![Tests: 189 Passed](https://img.shields.io/badge/tests-189%20passed-brightgreen.svg)](tests/)
+[![Tests: 293 Passed](https://img.shields.io/badge/tests-293%20passed-brightgreen.svg)](tests/)
 
 
 **Daily Streak Tool v2** là công cụ tự động hóa gửi video TikTok trực tiếp qua Direct Message (DM) theo lịch trình để duy trì chuỗi tương tác (streaks) với bạn bè.
@@ -143,7 +143,7 @@ pip install -e '.[tui,telegram,desktop]'
 > - `desktop`: Cài đặt `plyer>=2.1.0` để hiển thị popup thông báo trên desktop.
 > - `windows`: Cài đặt `pywin32>=306` (chỉ dành cho hệ điều hành Windows).
 >
-> 💡 **Về `requirements.txt` và `pyproject.toml`:** Dự án tuân thủ chuẩn PEP 517/621, sử dụng `pyproject.toml` làm nguồn chân lý duy nhất (single source of truth) cho các dependency và extras. File `requirements.txt` được giữ lại nhằm đảm bảo tương thích ngược với các workflow cài đặt truyền thống (`pip install -r requirements.txt`). Khuyến nghị dùng `pip install -e '.[tui,telegram]'` cho các môi trường phát triển mã nguồn, hoặc `pip install "./daily_streak_tool-2.1.0-py3-none-any.whl[telegram]"` khi triển khai wheel trên server độc lập.
+> 💡 **Về `requirements.txt` và `pyproject.toml`:** Dự án tuân thủ chuẩn PEP 517/621, sử dụng `pyproject.toml` làm nguồn chân lý duy nhất (single source of truth) cho các dependency và extras. File `requirements.txt` được giữ lại nhằm đảm bảo tương thích ngược với các workflow cài đặt truyền thống (`pip install -r requirements.txt`). Khuyến nghị dùng `pip install -e '.[tui,telegram]'` cho các môi trường phát triển mã nguồn, hoặc `pip install "./daily_streak_tool-2.2.0-py3-none-any.whl[telegram]"` khi triển khai wheel trên server độc lập.
 
 
 ### Bước 3: Cài đặt trình duyệt cho Playwright (nếu không dùng Chrome hệ thống)
@@ -225,6 +225,8 @@ cp config.example config.json
 | **`tiktok.dm_load_attempts`** | `int` | `2` | Số lần thử tải lại trang `/messages` nếu gặp lỗi timeout. |
 | **`tiktok.probe_timeout_ms`** | `int` | `750` | Timeout của các query kiểm tra CAPTCHA / popup. |
 | **`tiktok.recipient_retries`** | `int` | `1` | Số lần thử lại tối đa cho mỗi người nhận nếu gặp sự cố trước khi gửi tin nhắn. |
+| **`tiktok.message_format`** | `string` | `"native_video_card"` | Định dạng gửi tin nhắn: `"native_video_card"` (thẻ preview video đính kèm trực tiếp qua giao diện Share) hoặc `"raw_url"` (nhập đường dẫn URL thô vào composer). |
+| **`tiktok.allow_raw_url_fallback`** | `boolean` | `false` | Nếu `true`, tự động fallback sang gửi link thô khi luồng chia sẻ thẻ native gặp sự cố trước khi bấm gửi. |
 | **`runtime.run_lock_stale_seconds`** | `int` | `21600` (6h) | Thời gian coi lock file là stale nếu tiến trình cũ bị crash đột ngột. |
 | **`data_dir`** | `string` | Platform default | Thư mục lưu daily state, history, lock và logs (có thể ghi đè qua biến môi trường `DAILY_STREAK_DATA_DIR`). |
 | **`recipients`** | `list[object]` | `[]` | Danh sách người nhận: `[{"name": "Tên bạn bè", "username": "username_tiktok"}]`. |
@@ -468,7 +470,7 @@ Khi cài đặt extra `telegram`, bạn có thể nhận thông báo tức thờ
 pip install -e '.[telegram]'
 
 # Hoặc khi cài đặt từ file wheel (.whl) trên máy chủ:
-pip install "./daily_streak_tool-2.1.0-py3-none-any.whl[telegram]"
+pip install "./daily_streak_tool-2.2.0-py3-none-any.whl[telegram]"
 ```
 
 ### Các sự kiện gửi thông báo:

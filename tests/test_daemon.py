@@ -515,6 +515,11 @@ class DaemonTests(unittest.TestCase):
                         self.assertFalse(is_daemon_process_alive(12345))
 
     def test_detached_start_and_status_with_real_subprocess(self) -> None:
+        try:
+            import apscheduler
+        except ImportError:
+            self.skipTest("apscheduler is not installed in the running python environment")
+
         from daily_streak.config import save_config
         from daily_streak.daemon import DaemonManager
 

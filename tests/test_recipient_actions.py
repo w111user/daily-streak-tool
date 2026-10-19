@@ -120,3 +120,45 @@ class RecipientActionLifecycleTests(unittest.TestCase):
 
         self.assertTrue(context.pages[0].closed)
         self.assertTrue(context.closed)
+
+    def test_refresh_streaks_with_api_reader_and_factory(self) -> None:
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from daily_streak.streak_reader import StreakRecord, StreakStatus
+
+        with TemporaryDirectory() as tmp_dir:
+            config = {
+                "data_dir": tmp_dir,
+                "recipients": [{"name": "Test User", "username": "testuser"}],
+            }
+
+            class MockReader:
+                def __init__(self, cache, target_device=None):
+                    self.cache = cache
+                    self.target_device = target_device
+
+                def refresh_recipients(self, recipients, **kwargs):
+                    return [
+                        StreakRecord(
+                            username="testuser",
+                            status=StreakStatus.AVAILABLE,
+                            count=42,
+                        )
+                    ]
+
+            res = asyncio.run(
+                recipient_actions.refresh_streaks(
+                    config,
+                    [{"name": "Test User", "username": "testuser"}],
+                    reader_factory=lambda cache, dev: MockReader(cache, dev),
+                )
+            )
+
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0]["username"], "testuser")
+            self.assertEqual(res[0]["streak"]["count"], 42)
+            self.assertIn("42 ngày", res[0]["streak_display"])
+
+    def test_refresh_streaks_empty_recipients_returns_empty(self) -> None:
+        res = asyncio.run(recipient_actions.refresh_streaks({}, []))
+        self.assertEqual(res, [])

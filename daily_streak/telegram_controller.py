@@ -287,6 +287,7 @@ class TelegramController:
         daemon_service: DaemonService | None = None,
         sender_factory: SenderFactory = create_sender,
         now_provider: Callable[[], datetime] | None = None,
+        streak_refresher: Callable[..., Any] | None = None,
     ) -> None:
         self.config_path = Path(config_path)
         self.config_loader = config_loader
@@ -295,6 +296,8 @@ class TelegramController:
         self._daemon_service = daemon_service
         self._confirmations: dict[str, RunConfirmation] = {}
         self._sender_lock = asyncio.Lock()
+        self._streaks_refresh_lock = asyncio.Lock()
+        self._streak_refresher = streak_refresher
 
         initial_config = self.config_loader(self.config_path)
         raw_telegram = initial_config.get("telegram", {})
@@ -344,6 +347,7 @@ class TelegramController:
             "• `/status` — Trạng thái chi tiết (daemon, recipient, lịch gửi)\n"
             "• `/last` — Kết quả lượt gửi gần nhất từ lịch sử\n"
             "• `/next` — Lịch gửi tự động kế tiếp\n"
+            "• `/streaks` — Xem và làm mới trạng thái streak TikTok\n"
             "• `/start` — Khởi động daemon scheduler\n"
             "• `/stop` — Dừng daemon scheduler\n"
             "• `/pause` — Tạm dừng gửi tự động (giữ nguyên daemon)\n"
@@ -351,6 +355,7 @@ class TelegramController:
             "• `/run` — Kích hoạt một lượt gửi thủ công ngay (xác nhận Inline)"
         )
         if update.message:
+
             await update.message.reply_text(help_text, parse_mode="Markdown")
 
     async def handle_status(self, update: Any, context: Any) -> None:
@@ -495,7 +500,115 @@ class TelegramController:
         if update.message:
             await update.message.reply_text(text, parse_mode="Markdown")
 
+    def _build_streaks_keyboard(self) -> Any:
+        """Build the inline keyboard with '↻ Làm mới streak' button."""
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        except ImportError:
+            class InlineKeyboardButton:  # type: ignore[no-redef]
+                def __init__(self, text: str, callback_data: str) -> None:
+                    self.text = text
+                    self.callback_data = callback_data
+
+            class InlineKeyboardMarkup:  # type: ignore[no-redef]
+                def __init__(self, inline_keyboard: list[Any]) -> None:
+                    self.inline_keyboard = inline_keyboard
+
+        keyboard = [
+            [InlineKeyboardButton("↻ Làm mới streak", callback_data="streaks_refresh")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    def _format_streaks_message(
+        self,
+        recipients: Sequence[Mapping[str, Any]],
+        cache: Any,
+        *,
+        error_notice: str | None = None,
+    ) -> str:
+        """Format streak status for recipients including last refresh timestamp and status markers."""
+        from daily_streak.streak_reader import format_streak_display
+
+        lines = ["🔥 *Trạng thái Streak TikTok*\n"]
+        latest_success_dt: datetime | None = None
+
+        for r in recipients:
+            if not isinstance(r, Mapping):
+                continue
+            name = str(r.get("name") or "")
+            username = str(r.get("username") or "")
+            record = cache.get(username) if username else None
+            disp = format_streak_display(record)
+            target = f"{name} (@{username})" if username else f"{name} (unresolved)"
+            time_tag = ""
+            if record and record.updated_at:
+                try:
+                    dt = datetime.fromisoformat(record.updated_at)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if latest_success_dt is None or dt > latest_success_dt:
+                        latest_success_dt = dt
+                    time_tag = f" `({dt.strftime('%H:%M %d/%m')})`"
+                except Exception:
+                    pass
+            lines.append(f"• *{target}*: {disp}{time_tag}")
+
+        lines.append("")
+        if latest_success_dt is not None:
+            time_str = latest_success_dt.strftime("%H:%M:%S %d/%m/%Y")
+            lines.append(f"• *Lần làm mới gần nhất:* `{time_str}`")
+        else:
+            lines.append("• *Lần làm mới gần nhất:* `Chưa có dữ liệu`")
+
+        if error_notice:
+            lines.append(f"\n⚠️ *Lỗi làm mới:* {error_notice}\n_(Dữ liệu hiển thị phía trên vẫn là bản cache gần nhất)_")
+        else:
+            lines.append("\n_Nhấn nút bên dưới để làm mới trực tiếp từ TikTok API._")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _sanitize_streak_error(exc: Exception) -> str:
+        """Produce a safe, operator-friendly error message without leaking secrets."""
+        from daily_streak.lock import StreakLockedError
+
+        if isinstance(exc, StreakLockedError):
+            return "Một tiến trình khác đang cập nhật streak (`streak.lock`). Vui lòng thử lại sau."
+
+        err_str = str(exc).lower()
+        if "401" in err_str or "login" in err_str or "cookie" in err_str or "auth" in err_str:
+            return "Phiên đăng nhập TikTok (cookie) không hợp lệ hoặc đã hết hạn."
+        if "429" in err_str or "rate limit" in err_str or "too many" in err_str:
+            return "TikTok giới hạn tần suất yêu cầu (rate limit). Vui lòng đợi một lát."
+        if "timeout" in err_str or "connect" in err_str or "network" in err_str:
+            return "Lỗi kết nối mạng khi tải dữ liệu từ TikTok."
+        if "protobuf" in err_str or "decode" in err_str or "parse" in err_str:
+            return "Không thể phân tích dữ liệu phản hồi từ TikTok."
+        return f"Lỗi không xác định ({type(exc).__name__})."
+
+    async def handle_streaks(self, update: Any, context: Any) -> None:
+        """Handle /streaks command (cached streak status with interactive refresh)."""
+        if not self.is_authorized(update):
+            return
+
+        config = self.config_loader(self.config_path)
+        data_dir = get_data_dir(config)
+        from daily_streak.streak_reader import StreakCache
+
+        cache = StreakCache(data_dir)
+        recipients = config.get("recipients", [])
+        if not isinstance(recipients, list) or not recipients:
+            if update.message:
+                await update.message.reply_text("Không có recipient nào được cấu hình.")
+            return
+
+        text = self._format_streaks_message(recipients, cache)
+        reply_markup = self._build_streaks_keyboard()
+        if update.message:
+            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
     async def handle_start(self, update: Any, context: Any) -> None:
+
         """Handle /start command to start the background daemon."""
         if not self.is_authorized(update):
             return
@@ -597,7 +710,17 @@ class TelegramController:
 
         self._cleanup_expired_confirmations()
 
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        except ImportError:
+            class InlineKeyboardButton:  # type: ignore[no-redef]
+                def __init__(self, text: str, callback_data: str) -> None:
+                    self.text = text
+                    self.callback_data = callback_data
+
+            class InlineKeyboardMarkup:  # type: ignore[no-redef]
+                def __init__(self, inline_keyboard: list[Any]) -> None:
+                    self.inline_keyboard = inline_keyboard
 
         token = uuid.uuid4().hex[:12]
         now = time.time()
@@ -625,7 +748,7 @@ class TelegramController:
             await update.message.reply_text(prompt_text, reply_markup=reply_markup, parse_mode="Markdown")
 
     async def handle_callback(self, update: Any, context: Any) -> None:
-        """Handle inline button callback queries for /run confirmation."""
+        """Handle inline button callback queries for /run confirmation and /streaks refresh."""
         query = update.callback_query
         if not query:
             return
@@ -635,6 +758,24 @@ class TelegramController:
             return
 
         data = query.data or ""
+        if data == "streaks_refresh":
+            if self._streaks_refresh_lock.locked():
+                await query.answer("Đang trong quá trình làm mới streak, vui lòng đợi...", show_alert=True)
+                return
+
+            config = self.config_loader(self.config_path)
+            data_dir = get_data_dir(config)
+            from daily_streak.lock import StreakLock
+
+            streak_lock = StreakLock(data_dir)
+            if streak_lock.is_active():
+                await query.answer("Tiến trình làm mới streak khác đang chạy (`streak.lock`)!", show_alert=True)
+                return
+
+            await query.answer("Đang làm mới dữ liệu streak từ TikTok...")
+            asyncio.create_task(self._execute_streaks_refresh(query))
+            return
+
         if not (data.startswith("run_confirm:") or data.startswith("run_cancel:")):
             await query.answer()
             return
@@ -733,6 +874,53 @@ class TelegramController:
                 except Exception:
                     logger.exception("Failed to send error notification back to Telegram")
 
+    async def _execute_streaks_refresh(self, query: Any) -> None:
+        """Execute streak refresh in background and edit the callback message."""
+        if self._streaks_refresh_lock.locked():
+            return
+
+        async with self._streaks_refresh_lock:
+            config = self.config_loader(self.config_path)
+            data_dir = get_data_dir(config)
+            from daily_streak.streak_reader import StreakCache
+            from daily_streak.recipient_actions import refresh_streaks
+
+            recipients = config.get("recipients", [])
+            cache = StreakCache(data_dir)
+            error_notice: str | None = None
+
+            try:
+                if self._streak_refresher is not None:
+                    try:
+                        res = self._streak_refresher(config, recipients, force=True)
+                    except TypeError:
+                        res = self._streak_refresher(config, recipients)
+                    if asyncio.iscoroutine(res):
+                        await res
+                else:
+                    await refresh_streaks(config, recipients, force=True)
+                cache = StreakCache(data_dir)
+            except Exception as exc:
+                logger.warning("Streak refresh failed via Telegram: %s", exc)
+                error_notice = self._sanitize_streak_error(exc)
+
+            if isinstance(recipients, list):
+                updated_text = self._format_streaks_message(
+                    recipients,
+                    cache,
+                    error_notice=error_notice,
+                )
+                reply_markup = self._build_streaks_keyboard()
+                try:
+                    await query.edit_message_text(
+                        updated_text,
+                        reply_markup=reply_markup,
+                        parse_mode="Markdown",
+                    )
+                except Exception as exc:
+                    if "message is not modified" not in str(exc).lower():
+                        logger.warning("Failed to edit streak message: %s", exc)
+
     def build_application(self) -> Any:
         """Build and configure the python-telegram-bot Application."""
         try:
@@ -759,7 +947,9 @@ class TelegramController:
         app.add_handler(CommandHandler(["status"], self.handle_status))
         app.add_handler(CommandHandler(["last"], self.handle_last))
         app.add_handler(CommandHandler(["next"], self.handle_next))
+        app.add_handler(CommandHandler(["streaks"], self.handle_streaks))
         app.add_handler(CommandHandler(["start"], self.handle_start))
+
         app.add_handler(CommandHandler(["stop"], self.handle_stop))
         app.add_handler(CommandHandler(["pause"], self.handle_pause))
         app.add_handler(CommandHandler(["resume"], self.handle_resume))

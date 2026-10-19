@@ -15,6 +15,7 @@ from daily_streak.history import RunHistoryStore
 from daily_streak.models import RecipientResult, RunSummary
 from daily_streak.paths import get_data_dir
 from daily_streak.state import normalize_username
+from daily_streak.streak_reader import StreakCache, format_streak_display
 
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ class TuiController:
         """Refresh configuration, dashboard state, history, and selected recipients."""
 
         self.config = self.config_loader(self.config_path)
+        self.streak_cache = StreakCache(get_data_dir(self.config))
         # Configured recipients are the initial catalog, not merely a detached
         # selection set.  This makes their rows render before any browser scan.
         self._catalog = [
@@ -170,15 +172,22 @@ class TuiController:
     def recipient_rows(self) -> list[dict[str, object]]:
         """Return catalog rows for rendering without exposing mutable internals."""
 
-        return [
-            {
-                "key": self._recipient_key(catalog_recipient.values),
-                "selected": catalog_recipient.selected,
-                "name": str(catalog_recipient.values.get("name") or ""),
-                "username": str(catalog_recipient.values.get("username") or ""),
-            }
-            for catalog_recipient in self._catalog
-        ]
+        rows: list[dict[str, object]] = []
+        for catalog_recipient in self._catalog:
+            username = str(catalog_recipient.values.get("username") or "")
+            record = self.streak_cache.get(username) if username else None
+            streak_display = format_streak_display(record)
+            rows.append(
+                {
+                    "key": self._recipient_key(catalog_recipient.values),
+                    "selected": catalog_recipient.selected,
+                    "name": str(catalog_recipient.values.get("name") or ""),
+                    "username": username,
+                    "streak": streak_display,
+                }
+            )
+        return rows
+
 
     def toggle_recipient(self, key: str) -> bool:
         """Select or deselect one catalog recipient and persist the selection."""
@@ -225,7 +234,28 @@ class TuiController:
         self._persist_selection()
         return self.recipient_rows()
 
+    async def refresh_streaks(self) -> list[dict[str, object]]:
+        """Refresh streak statuses for selected recipients via TikTok API / Android."""
+
+        from daily_streak.android_streak_reader import AdbError
+        from daily_streak.api_streak_reader import ApiStreakError
+        from daily_streak.recipient_actions import refresh_streaks
+
+        selected = self._selected_recipients()
+        targets = selected if selected else [c.values for c in self._catalog]
+        if not targets:
+            raise TuiInputError("No recipients available to refresh streaks.")
+        try:
+            await refresh_streaks(self.config, targets, force=True)
+        except ApiStreakError as exc:
+            raise TuiInputError(f"Không thể làm mới streak qua TikTok API: {exc}") from exc
+        except AdbError as exc:
+            raise TuiInputError(f"Không thể làm mới streak qua Android: {exc}") from exc
+        self.streak_cache.load()
+        return self.recipient_rows()
+
     async def send(self, *, force: bool = False) -> RunSummary:
+
         """Use the shared sender and expose its typed progress callbacks."""
 
         selected = self._selected_recipients()
@@ -456,6 +486,7 @@ def create_tui_app(
             Binding("f", "force_send", "Force send"),
             Binding("c", "scan", "Scan"),
             Binding("r", "resolve", "Resolve"),
+            Binding("t", "refresh_streaks", "Streaks"),
             Binding("space", "toggle_recipient", "Toggle"),
             Binding("a", "select_all", "Select all"),
             Binding("d", "deselect_all", "Deselect"),
@@ -504,11 +535,12 @@ def create_tui_app(
             self.query_one("#results", DataTable).add_columns(
                 "Recipient", "Username", "Status", "Attempts", "Video", "Error"
             )
-            self.query_one("#recipients", DataTable).add_columns("Selected", "Name", "Username")
+            self.query_one("#recipients", DataTable).add_columns("Selected", "Name", "Username", "Streak")
             self.query_one("#videos", DataTable).add_columns("#", "Video")
             self.query_one("#history", DataTable).add_columns(
                 "Finished", "Success", "Failed", "Unconfirmed", "Skipped"
             )
+
             self._log_handler = _TuiLogHandler(self)
             self._log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
             logging.getLogger().addHandler(self._log_handler)
@@ -579,7 +611,13 @@ def create_tui_app(
                 return
             self._start_operation("Resolving selected usernames", self.controller.resolve())
 
+        def action_refresh_streaks(self) -> None:
+            if self._busy():
+                return
+            self._start_operation("Refreshing TikTok streak statuses", self.controller.refresh_streaks())
+
         def action_toggle_recipient(self) -> None:
+
             if self._busy():
                 return
             table = self.query_one("#recipients", DataTable)
@@ -781,7 +819,9 @@ def create_tui_app(
                     "✓" if row["selected"] else "",
                     str(row["name"]),
                     f"@{row['username']}" if row["username"] else "unresolved",
+                    str(row.get("streak") or "Chưa xác định"),
                 )
+
 
         def _render_videos(self) -> None:
             table = self.query_one("#videos", DataTable)

@@ -65,9 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
         ("list", "List configured recipients without launching a browser"),
         ("scan", "Scan currently visible TikTok DM conversations"),
         ("resolve", "Resolve configured display names to TikTok usernames"),
+        ("refresh-streaks", "Refresh streak status from TikTok Android UI for configured recipients (read-only)"),
     ):
         child = recipient_commands.add_parser(name, help=help_text)
         child.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
+        if name == "refresh-streaks":
+            child.add_argument("--device", dest="device_id", default=None, help="Target Android device serial/ID")
+        if name == "list":
+            child.add_argument("--show-streaks", action="store_true", help="Display cached TikTok streak status")
+
 
     videos = commands.add_parser("videos", help="Inspect configured video links")
     video_commands = videos.add_subparsers(dest="video_command", required=True)
@@ -129,13 +135,34 @@ def run_cli(
             return EXIT_OK
         if arguments.command == "recipients":
             config = load_config(config_path)
+            show_streaks = bool(getattr(arguments, "show_streaks", False))
             if arguments.recipient_command == "list":
                 recipients = configured_recipients(config)
+            elif arguments.recipient_command == "refresh-streaks":
+                device_id = getattr(arguments, "device_id", None)
+                recipients = asyncio.run(_run_recipient_action(config, arguments.recipient_command, device_id=device_id))
+                show_streaks = True
             else:
                 recipients = asyncio.run(_run_recipient_action(config, arguments.recipient_command))
-            payload = {"recipients": recipients, "config_modified": False}
+
+            if show_streaks and arguments.recipient_command != "refresh-streaks":
+                from daily_streak.streak_reader import StreakCache, format_streak_display
+
+                cache = StreakCache(get_data_dir(config))
+                enriched: list[dict[str, Any]] = []
+                for item in recipients:
+                    row = dict(item)
+                    username = str(row.get("username") or "")
+                    record = cache.get(username) if username else None
+                    row["streak"] = record.to_dict() if record else None
+                    row["streak_display"] = format_streak_display(record)
+                    enriched.append(row)
+                recipients = enriched
+
+            payload = {"recipients": recipients, "config_modified": False, "show_streaks": show_streaks}
             _write_payload(payload, bool(arguments.json_output), stdout, _format_recipients)
             return EXIT_OK
+
         if arguments.command == "send":
             config = load_config(config_path)
             summary = asyncio.run(_run_send(config, bool(arguments.force), sender_factory))
@@ -195,6 +222,65 @@ def run_cli(
         _write_error(stderr, "Interrupted.")
         return EXIT_INTERRUPTED
     except Exception as exc:
+        from daily_streak.android_streak_reader import (
+            AdbDeviceNotFoundError,
+            AdbMultipleDevicesError,
+            AdbUnavailableError,
+        )
+        from daily_streak.api_streak_reader import (
+            ApiStreakAuthError,
+            ApiStreakError,
+            ApiStreakNetworkError,
+            ApiStreakParseError,
+        )
+
+        if isinstance(exc, ApiStreakAuthError):
+            _write_error(
+                stderr,
+                f"Lỗi xác thực TikTok API: {exc}\n"
+                "Vui lòng kiểm tra file cookies.json hoặc làm mới cookie phiên đăng nhập TikTok.",
+            )
+            return EXIT_RUNTIME
+        if isinstance(exc, ApiStreakNetworkError):
+            _write_error(
+                stderr,
+                f"Lỗi mạng TikTok API: {exc}\n"
+                "Không thể kết nối đến máy chủ TikTok streak. Vui lòng kiểm tra kết nối mạng.",
+            )
+            return EXIT_RUNTIME
+        if isinstance(exc, ApiStreakParseError):
+            _write_error(
+                stderr,
+                f"Lỗi phân tích TikTok API: {exc}\n"
+                "Phản hồi từ máy chủ TikTok không hợp lệ hoặc cấu trúc dữ liệu đã thay đổi.",
+            )
+            return EXIT_RUNTIME
+        if isinstance(exc, ApiStreakError):
+            _write_error(stderr, f"Lỗi TikTok API streak reader: {exc}")
+            return EXIT_RUNTIME
+
+        if isinstance(exc, AdbUnavailableError):
+            _write_error(
+                stderr,
+                f"Lỗi ADB: {exc}\n"
+                "Vui lòng cài đặt Android Debug Bridge ('adb') và đảm bảo lệnh có trong PATH.",
+            )
+            return EXIT_RUNTIME
+        if isinstance(exc, AdbDeviceNotFoundError):
+            _write_error(
+                stderr,
+                f"Lỗi thiết bị Android: {exc}\n"
+                "Vui lòng cắm điện thoại qua USB, bật USB Debugging, hoặc cấu hình 'android.device_id'.",
+            )
+            return EXIT_RUNTIME
+        if isinstance(exc, AdbMultipleDevicesError):
+            _write_error(
+                stderr,
+                f"Nhiều thiết bị Android: {exc}\n"
+                "Vui lòng truyền cờ '--device <device_id>' hoặc cấu hình 'android.device_id' trong config.json.",
+            )
+            return EXIT_RUNTIME
+
         logger.exception("Command failed")
         _write_error(stderr, f"Runtime error: {exc}")
         return EXIT_RUNTIME
@@ -282,20 +368,6 @@ async def _run_telegram_controller(
     stderr: TextIO,
     sender_factory: SenderFactory | None,
 ) -> int:
-    try:
-        import telegram
-        import telegram.ext
-    except ImportError:
-        _write_error(
-            stderr,
-            "Error: python-telegram-bot is required to run the Telegram remote controller.\n"
-            "Install the telegram extra using:\n"
-            "  pip install 'daily-streak-tool[telegram]'\n"
-            "or (from wheel):\n"
-            "  pip install '<wheel-path>[telegram]'",
-        )
-        return EXIT_RUNTIME
-
     config = load_config(config_path)
     raw_telegram = config.get("telegram", {})
     telegram_cfg: Mapping[str, Any] = (
@@ -325,6 +397,20 @@ async def _run_telegram_controller(
         )
         return EXIT_CONFIGURATION
 
+    try:
+        import telegram
+        import telegram.ext
+    except ImportError:
+        _write_error(
+            stderr,
+            "Error: python-telegram-bot is required to run the Telegram remote controller.\n"
+            "Install the telegram extra using:\n"
+            "  pip install 'daily-streak-tool[telegram]'\n"
+            "or (from wheel):\n"
+            "  pip install '<wheel-path>[telegram]'",
+        )
+        return EXIT_RUNTIME
+
     from daily_streak.telegram_controller import TelegramController
 
     controller = TelegramController(
@@ -344,16 +430,21 @@ def _default_sender_factory() -> SenderFactory:
 async def _run_recipient_action(
     config: Mapping[str, Any],
     action: str,
+    *,
+    device_id: str | None = None,
 ) -> list[dict[str, str]]:
-    """Delegate recipient browser work to the shared short-lived session adapter."""
+    """Delegate recipient browser or Android work to the shared adapter."""
 
-    from daily_streak.recipient_actions import resolve_recipients, scan_recipients
+    from daily_streak.recipient_actions import refresh_streaks, resolve_recipients, scan_recipients
 
     if action == "scan":
         return await scan_recipients(config)
     if action == "resolve":
         return await resolve_recipients(config, configured_recipients(config))
+    if action == "refresh-streaks":
+        return await refresh_streaks(config, configured_recipients(config), force=True, device_id=device_id)
     raise ValueError(f"Unknown recipient operation: {action}")
+
 
 
 def _run_doctor(config_path: Path, json_output: bool, stdout: TextIO) -> int:
@@ -367,17 +458,18 @@ def _run_doctor(config_path: Path, json_output: bool, stdout: TextIO) -> int:
     return EXIT_RUNTIME if report.fail_count else EXIT_OK
 
 
-def configured_recipients(config: Mapping[str, Any]) -> list[dict[str, str]]:
+def configured_recipients(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     raw_recipients = config.get("recipients", [])
     if not isinstance(raw_recipients, list):
         return []
-    recipients: list[dict[str, str]] = []
+    recipients: list[dict[str, Any]] = []
     for item in raw_recipients:
         if not isinstance(item, Mapping):
             continue
-        name = str(item.get("name") or "")
-        username = str(item.get("username") or "")
-        recipients.append({"name": name, "username": username})
+        entry = dict(item)
+        entry["name"] = str(item.get("name") or "")
+        entry["username"] = str(item.get("username") or "")
+        recipients.append(entry)
     return recipients
 
 
@@ -530,14 +622,21 @@ def _format_recipients(payload: Mapping[str, object]) -> str:
     if not isinstance(recipients, list) or not recipients:
         return "No recipients configured or found."
     lines = []
+    show_streaks = bool(payload.get("show_streaks"))
     for recipient in recipients:
         if not isinstance(recipient, Mapping):
             continue
         name = recipient.get("name") or "(unnamed)"
         username = recipient.get("username") or "unresolved"
-        lines.append(f"{name}  @{username}" if username != "unresolved" else f"{name}  (unresolved)")
+        base_line = f"{name}  @{username}" if username != "unresolved" else f"{name}  (unresolved)"
+        if show_streaks:
+            streak_disp = str(recipient.get("streak_display") or "Chưa xác định")
+            lines.append(f"{base_line}  [Streak: {streak_disp}]")
+        else:
+            lines.append(base_line)
     lines.append("Configuration was not modified.")
     return "\n".join(lines)
+
 
 
 def _format_videos(payload: Mapping[str, object]) -> str:

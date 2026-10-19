@@ -375,6 +375,13 @@ class RecipientService:
 
         current_page = page
         for attempt in range(1, self.dm_load_attempts + 1):
+            if getattr(current_page, "is_closed", lambda: False)():
+                context = getattr(current_page, "context", None)
+                if callable(context):
+                    context = context()
+                if context is not None and callable(getattr(context, "new_page", None)):
+                    logger.info("%s page was closed; creating a fresh page", caller)
+                    current_page = await context.new_page()
             logger.info(
                 "%s DM load attempt %d/%d",
                 caller,
@@ -409,6 +416,30 @@ class RecipientService:
             return current_page, readiness
 
         raise AssertionError("TikTok DM load attempts unexpectedly exhausted.")
+
+    async def is_page_dm_ready(self, page: Any) -> bool:
+        """Check whether a retained page is open on /messages and has a visible conversation list."""
+
+        if getattr(page, "is_closed", lambda: False)():
+            return False
+        url = getattr(page, "url", "")
+        if not is_tiktok_http_url(url) or "/messages" not in url.lower():
+            return False
+        if "login" in url.lower():
+            return False
+        try:
+            captcha = page.locator("[data-e2e='captcha-verify-container'], .captcha-verify-container").first
+            if await captcha.count() > 0 and await captcha.is_visible():
+                return False
+        except Exception:
+            pass
+        try:
+            conv_list = page.locator(CONVERSATION_LIST_SELECTOR).first
+            if await conv_list.count() == 0:
+                return False
+            return await conv_list.is_visible()
+        except Exception:
+            return False
 
     async def wait_for_dm_conversation_list(self, page: Any) -> tuple[Any, Any, bool]:
         """Wait only for the DM list after returning from an opened chat.
@@ -780,6 +811,7 @@ class RecipientService:
         notifier: Any,
         *,
         configured_display_name: str | None = None,
+        reuse_existing_page: bool = False,
     ) -> tuple[Any, str]:
         """Open the DM conversation that corresponds to a known username.
 
@@ -796,12 +828,15 @@ class RecipientService:
                 "Selecting recipient %s using configured display name",
                 display_name,
             )
+            kwargs: dict[str, Any] = {"reject_ambiguous": True}
+            if reuse_existing_page:
+                kwargs["reuse_existing_page"] = True
             return await self._select_recipient_by_display_name(
                 page,
                 display_name,
                 username,
                 notifier,
-                reject_ambiguous=True,
+                **kwargs,
             )
 
         logger.info("Display name unavailable; falling back to TikTok profile lookup")
@@ -846,13 +881,36 @@ class RecipientService:
         notifier: Any,
         *,
         reject_ambiguous: bool,
+        reuse_existing_page: bool = False,
     ) -> tuple[Any, str]:
         """Open a selected recipient's DM and wait for its message composer."""
 
-        page, readiness = await self._load_messages_with_renderer_recovery(
-            page,
-            caller="Send",
-        )
+        readiness: tuple[Any, Any, bool] | None = None
+        if reuse_existing_page:
+            try:
+                if await self.is_page_dm_ready(page):
+                    logger.info("Reusing existing DM conversation list for %s", display_name)
+                    try:
+                        conv_list = page.locator(CONVERSATION_LIST_SELECTOR).first
+                        await conv_list.evaluate("(element) => element.scrollTo(0, 0)")
+                    except Exception:
+                        pass
+                    readiness = await self.wait_for_dm_conversation_list(page)
+                else:
+                    logger.info("Retained DM page not currently ready for %s; performing full load", display_name)
+            except Exception as exc:
+                logger.warning(
+                    "Retained DM page recovery needed for %s (%s); performing full load",
+                    display_name,
+                    exc,
+                )
+                readiness = None
+
+        if readiness is None:
+            page, readiness = await self._load_messages_with_renderer_recovery(
+                page,
+                caller="Send",
+            )
         await self._handle_tiktok_interruptions(page, notifier)
         await self.click_conversation_by_display_name(
             page,

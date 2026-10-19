@@ -20,7 +20,7 @@ from daily_streak.history import RunHistoryStore
 from daily_streak.models import RecipientResult, RecipientStatus, RunSummary
 
 
-def test_config(data_dir: Path) -> dict[str, object]:
+def make_test_config(data_dir: Path) -> dict[str, object]:
     return {
         "data_dir": str(data_dir),
         "schedule": {"time": "00:00", "timezone": "UTC", "run_on_start": False},
@@ -51,7 +51,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
             stdout = StringIO()
             exit_code = run_cli(["--config", str(config_path), "status"], stdout=stdout, stderr=StringIO())
 
@@ -65,7 +65,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
             stdout = StringIO()
             stderr = StringIO()
             exit_code = run_cli(
@@ -83,7 +83,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
             summary = RunSummary().finish()
             sender = FakeSender(summary)
 
@@ -113,7 +113,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
             exit_code = run_cli(
                 ["--config", str(config_path), "send", "--json"],
                 stdout=StringIO(),
@@ -128,7 +128,7 @@ class CliTests(unittest.TestCase):
             root = Path(temporary_directory)
             data_dir = root / "data"
             config_path = root / "config.json"
-            save_config(test_config(data_dir), config_path)
+            save_config(make_test_config(data_dir), config_path)
             history = RunHistoryStore(data_dir)
             history.append(RunSummary().finish())
             history.append(RunSummary().finish())
@@ -155,7 +155,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
             stdout = StringIO()
             exit_code = run_cli(
                 ["--config", str(config_path), "doctor", "--json"],
@@ -173,7 +173,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
             stdout = StringIO()
             exit_code = run_cli(
                 ["--config", str(config_path), "status"],
@@ -197,7 +197,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
 
             stdout = StringIO()
             exit_code = run_cli(
@@ -230,7 +230,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
 
             mock_status = {
                 "status": "Running",
@@ -272,7 +272,7 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "config.json"
-            save_config(test_config(root / "data"), config_path)
+            save_config(make_test_config(root / "data"), config_path)
 
             with patch("daily_streak.daemon.DaemonManager.stop", return_value=True):
                 stdout = StringIO()
