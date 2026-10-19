@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -1295,3 +1295,109 @@ class RecipientUtilityTests(unittest.TestCase):
 
         self.assertFalse(first.clicked)
         self.assertFalse(second.clicked)
+
+    def test_is_page_dm_ready_validations(self) -> None:
+        service = RecipientService()
+
+        class MockPage:
+            def __init__(self, url: str = "https://www.tiktok.com/messages", closed: bool = False, has_list: bool = True, has_captcha: bool = False) -> None:
+                self.url = url
+                self._closed = closed
+                self.has_list = has_list
+                self.has_captcha = has_captcha
+
+            def is_closed(self) -> bool:
+                return self._closed
+
+            def locator(self, selector: str) -> Any:
+                class Element:
+                    def __init__(self, visible: bool) -> None:
+                        self._visible = visible
+                    async def count(self) -> int:
+                        return 1 if self._visible else 0
+                    async def is_visible(self) -> bool:
+                        return self._visible
+                    @property
+                    def first(self) -> "Element":
+                        return self
+
+                if "captcha" in selector:
+                    return Element(self.has_captcha)
+                if "conversation-list" in selector:
+                    return Element(self.has_list)
+                return Element(False)
+
+        # 1. Closed page -> False
+        self.assertFalse(asyncio.run(service.is_page_dm_ready(MockPage(closed=True))))
+        # 2. Non-TikTok url -> False
+        self.assertFalse(asyncio.run(service.is_page_dm_ready(MockPage(url="https://google.com"))))
+        # 3. Login url -> False
+        self.assertFalse(asyncio.run(service.is_page_dm_ready(MockPage(url="https://www.tiktok.com/login"))))
+        # 4. Captcha visible -> False
+        self.assertFalse(asyncio.run(service.is_page_dm_ready(MockPage(has_captcha=True))))
+        # 5. Conversation list missing -> False
+        self.assertFalse(asyncio.run(service.is_page_dm_ready(MockPage(has_list=False))))
+        # 6. Valid ready page -> True
+        self.assertTrue(asyncio.run(service.is_page_dm_ready(MockPage())))
+
+    def test_select_recipient_reuses_dm_list_when_page_is_ready(self) -> None:
+        service = RecipientService()
+        mock_page = MagicMock()
+        mock_page.evaluate = AsyncMock()
+        mock_list = MagicMock()
+        mock_list.evaluate = AsyncMock()
+        mock_page.locator.return_value.first = mock_list
+
+        service.is_page_dm_ready = AsyncMock(return_value=True)
+        readiness = (mock_list, MagicMock(), False)
+        service.wait_for_dm_conversation_list = AsyncMock(return_value=readiness)
+        service._load_messages_with_renderer_recovery = AsyncMock()
+        service._handle_tiktok_interruptions = AsyncMock()
+        service.click_conversation_by_display_name = AsyncMock()
+        service.wait_for_message_input = AsyncMock()
+
+        with patch("daily_streak.recipients.handle_sleep_hours_popup", new=AsyncMock()):
+            page, name = asyncio.run(
+                service.select_recipient_for_username_with_page(
+                    mock_page,
+                    "alice",
+                    object(),
+                    configured_display_name="Alice",
+                    reuse_existing_page=True,
+                )
+            )
+
+        self.assertEqual(name, "Alice")
+        service.is_page_dm_ready.assert_awaited_once_with(mock_page)
+        service.wait_for_dm_conversation_list.assert_awaited_once_with(mock_page)
+        # Crucial: full messages reload was bypassed!
+        service._load_messages_with_renderer_recovery.assert_not_awaited()
+        service.click_conversation_by_display_name.assert_awaited_once()
+
+    def test_select_recipient_recovers_via_full_load_when_retained_page_not_ready(self) -> None:
+        service = RecipientService()
+        mock_page = MagicMock()
+        mock_page.evaluate = AsyncMock()
+        service.is_page_dm_ready = AsyncMock(return_value=False)
+        readiness = (MagicMock(), MagicMock(), False)
+        service._load_messages_with_renderer_recovery = AsyncMock(return_value=(mock_page, readiness))
+        service.wait_for_dm_conversation_list = AsyncMock()
+        service._handle_tiktok_interruptions = AsyncMock()
+        service.click_conversation_by_display_name = AsyncMock()
+        service.wait_for_message_input = AsyncMock()
+
+        with patch("daily_streak.recipients.handle_sleep_hours_popup", new=AsyncMock()):
+            page, name = asyncio.run(
+                service.select_recipient_for_username_with_page(
+                    mock_page,
+                    "alice",
+                    object(),
+                    configured_display_name="Alice",
+                    reuse_existing_page=True,
+                )
+            )
+
+        self.assertEqual(name, "Alice")
+        service.is_page_dm_ready.assert_awaited_once_with(mock_page)
+        # Fallback to full load was triggered
+        service._load_messages_with_renderer_recovery.assert_awaited_once()

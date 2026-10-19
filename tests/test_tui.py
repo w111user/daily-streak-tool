@@ -80,9 +80,11 @@ class TuiControllerTests(unittest.TestCase):
                     "selected": True,
                     "name": "Đức Khoa",
                     "username": "khoa_memezlol",
+                    "streak": "Chưa xác định",
                 }
             ],
         )
+
 
     def test_configured_recipients_initialize_as_selected_tui_targets(self) -> None:
         with TemporaryDirectory() as temporary_directory:

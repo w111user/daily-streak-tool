@@ -43,6 +43,7 @@ def create_sender(
     config: Mapping[str, Any],
     *,
     on_recipient_result: Callable[[Any, RunSummary], None] | None = None,
+    **kwargs: Any,
 ) -> Any:
     """Construct the standard shared sender without importing GUI code."""
 
@@ -55,6 +56,7 @@ def create_sender(
         Notifier(config),
         VideoPool(config),
         on_recipient_result=on_recipient_result,
+        **kwargs,
     )
 
 

@@ -320,3 +320,43 @@ class DaemonLock:
             logger.warning("Recovered stale daemon lock at %s", self.path)
         except FileNotFoundError:
             return
+
+
+STREAK_LOCK_FILENAME = "streak.lock"
+DEFAULT_STREAK_LOCK_STALE_SECONDS = 120.0
+
+
+class StreakLockedError(RuntimeError):
+    """Raised when another streak refresh operation is already active."""
+
+
+class StreakLock(RunLock):
+    """Exclusive cross-process lock used to prevent overlapping streak refresh requests."""
+
+    def __init__(
+        self,
+        data_dir: str | Path,
+        *,
+        stale_seconds: float = DEFAULT_STREAK_LOCK_STALE_SECONDS,
+        now: Callable[[], float] = time.time,
+        pid: int | None = None,
+        hostname: str | None = None,
+        process_is_alive: Callable[[int], bool] | None = None,
+    ) -> None:
+        super().__init__(
+            data_dir,
+            stale_seconds=stale_seconds,
+            now=now,
+            pid=pid,
+            hostname=hostname,
+            process_is_alive=process_is_alive,
+        )
+        self.path = Path(data_dir) / STREAK_LOCK_FILENAME
+
+    def acquire(self) -> None:
+        try:
+            super().acquire()
+        except RunLockedError as exc:
+            raise StreakLockedError(
+                f"A streak refresh is already running (lock: {self.path})."
+            ) from exc

@@ -7,11 +7,17 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import time
 from typing import Any
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+if "telegram" not in sys.modules:
+    sys.modules["telegram"] = MagicMock()
+if "telegram.ext" not in sys.modules:
+    sys.modules["telegram.ext"] = MagicMock()
 
 from daily_streak.cli import EXIT_CONFIGURATION, EXIT_RUNTIME, run_cli
 from daily_streak.config import save_config
@@ -321,6 +327,16 @@ class TelegramControllerTests(unittest.TestCase):
             self.assertIn("Lịch gửi tự động kế tiếp", next_text)
             self.assertIn("Đếm ngược", next_text)
 
+            # /streaks
+            streaks_update = FakeUpdate(chat_id="123456789")
+            asyncio.run(controller.handle_streaks(streaks_update, None))
+            streaks_text = streaks_update.message.reply_text.call_args[0][0]
+            self.assertIn("Trạng thái Streak TikTok", streaks_text)
+            self.assertIn("Test User", streaks_text)
+            self.assertIn("Chưa xác định", streaks_text)
+
+
+
     def test_handle_start_stop_pause_resume(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             data_dir = Path(tmp_dir)
@@ -510,6 +526,203 @@ class TelegramControllerTests(unittest.TestCase):
                 mock_notifier.batch_completion.assert_not_called()
 
 
+
+    def test_streaks_command_includes_refresh_button_and_status(self) -> None:
+        from daily_streak.streak_reader import StreakCache, StreakRecord, StreakStatus
+
+        with TemporaryDirectory() as tmp_dir:
+            data_dir = Path(tmp_dir)
+            config_path = data_dir / "config.json"
+            cfg = sample_config(data_dir)
+            cfg["recipients"] = [
+                {"name": "Alice", "username": "alice"},
+                {"name": "Bob", "username": "bob"},
+                {"name": "Charlie", "username": "charlie"},
+            ]
+            save_config(cfg, config_path)
+
+            cache = StreakCache(data_dir)
+            cache.set(StreakRecord(username="alice", status=StreakStatus.AVAILABLE, count=99, updated_at="2026-10-19T10:00:00+00:00"))
+            cache.set(StreakRecord(username="bob", status=StreakStatus.NOT_ACTIVE, updated_at="2026-10-19T09:00:00+00:00"))
+            # charlie is not in cache (unknown)
+
+            controller = TelegramController(config_path, config_loader=lambda _: cfg)
+            update = FakeUpdate(chat_id="123456789")
+
+            asyncio.run(controller.handle_streaks(update, None))
+
+            update.message.reply_text.assert_called_once()
+            text = update.message.reply_text.call_args[0][0]
+            kwargs = update.message.reply_text.call_args[1]
+
+            self.assertIn("🔥 99 ngày", text)
+            self.assertIn("Chưa kích hoạt", text)
+            self.assertIn("Chưa xác định", text)
+            self.assertIn("Lần làm mới gần nhất", text)
+            self.assertIn("10:00:00 19/10/2026", text)
+
+            reply_markup = kwargs.get("reply_markup")
+            self.assertIsNotNone(reply_markup)
+            import telegram
+            if isinstance(telegram.InlineKeyboardButton, MagicMock):
+                telegram.InlineKeyboardButton.assert_any_call("↻ Làm mới streak", callback_data="streaks_refresh")
+            else:
+                self.assertEqual(reply_markup.inline_keyboard[0][0].text, "↻ Làm mới streak")
+                self.assertEqual(reply_markup.inline_keyboard[0][0].callback_data, "streaks_refresh")
+
+    def test_streaks_refresh_callback_success_updates_message(self) -> None:
+        from daily_streak.streak_reader import StreakCache, StreakRecord, StreakStatus
+
+        with TemporaryDirectory() as tmp_dir:
+            data_dir = Path(tmp_dir)
+            config_path = data_dir / "config.json"
+            cfg = sample_config(data_dir)
+            save_config(cfg, config_path)
+
+            cache = StreakCache(data_dir)
+            cache.set(StreakRecord(username="testuser", status=StreakStatus.AVAILABLE, count=10))
+
+            refresh_called = []
+
+            def fake_refresher(config, recipients, **kwargs):
+                refresh_called.append((config, recipients))
+                c = StreakCache(data_dir)
+                c.set(StreakRecord(username="testuser", status=StreakStatus.AVAILABLE, count=11, updated_at="2026-10-19T12:00:00+00:00"))
+                return []
+
+            controller = TelegramController(
+                config_path,
+                config_loader=lambda _: cfg,
+                streak_refresher=fake_refresher,
+            )
+
+            update = FakeCallbackQueryUpdate(chat_id="123456789", data="streaks_refresh")
+
+            async def run_callback() -> None:
+                await controller.handle_callback(update, None)
+                tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+            asyncio.run(run_callback())
+
+            self.assertEqual(len(refresh_called), 1)
+            update.callback_query.answer.assert_called_with("Đang làm mới dữ liệu streak từ TikTok...")
+            update.callback_query.edit_message_text.assert_called_once()
+            edited_text = update.callback_query.edit_message_text.call_args[0][0]
+            self.assertIn("🔥 11 ngày", edited_text)
+            self.assertIn("12:00:00 19/10/2026", edited_text)
+
+    def test_streaks_refresh_callback_unauthorized(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            data_dir = Path(tmp_dir)
+            config_path = data_dir / "config.json"
+            cfg = sample_config(data_dir)
+            save_config(cfg, config_path)
+
+            refresher = MagicMock()
+            controller = TelegramController(
+                config_path,
+                config_loader=lambda _: cfg,
+                streak_refresher=refresher,
+            )
+
+            # Different chat_id
+            update = FakeCallbackQueryUpdate(chat_id="999999999", data="streaks_refresh")
+            asyncio.run(controller.handle_callback(update, None))
+
+            update.callback_query.answer.assert_called_with("Truy cập không được phép.", show_alert=True)
+            refresher.assert_not_called()
+            update.callback_query.edit_message_text.assert_not_called()
+
+    def test_streaks_refresh_callback_locked_in_process_and_streak_lock(self) -> None:
+        from daily_streak.lock import StreakLock
+
+        with TemporaryDirectory() as tmp_dir:
+            data_dir = Path(tmp_dir)
+            config_path = data_dir / "config.json"
+            cfg = sample_config(data_dir)
+            save_config(cfg, config_path)
+
+            refresher = MagicMock()
+            controller = TelegramController(
+                config_path,
+                config_loader=lambda _: cfg,
+                streak_refresher=refresher,
+            )
+
+            # Case 1: StreakLock is active on the host
+            lock = StreakLock(data_dir)
+            lock.acquire()
+            try:
+                update1 = FakeCallbackQueryUpdate(chat_id="123456789", data="streaks_refresh")
+                asyncio.run(controller.handle_callback(update1, None))
+                update1.callback_query.answer.assert_called_with(
+                    "Tiến trình làm mới streak khác đang chạy (`streak.lock`)!",
+                    show_alert=True,
+                )
+                refresher.assert_not_called()
+            finally:
+                lock.release()
+
+            # Case 2: In-process lock is locked
+            async def test_locked():
+                async with controller._streaks_refresh_lock:
+                    update2 = FakeCallbackQueryUpdate(chat_id="123456789", data="streaks_refresh")
+                    await controller.handle_callback(update2, None)
+                    update2.callback_query.answer.assert_called_with(
+                        "Đang trong quá trình làm mới streak, vui lòng đợi...",
+                        show_alert=True,
+                    )
+                    refresher.assert_not_called()
+
+            asyncio.run(test_locked())
+
+    def test_streaks_refresh_callback_sanitized_errors_preserve_cache(self) -> None:
+        from daily_streak.streak_reader import StreakCache, StreakRecord, StreakStatus
+
+        with TemporaryDirectory() as tmp_dir:
+            data_dir = Path(tmp_dir)
+            config_path = data_dir / "config.json"
+            cfg = sample_config(data_dir)
+            save_config(cfg, config_path)
+
+            cache = StreakCache(data_dir)
+            cache.set(StreakRecord(username="testuser", status=StreakStatus.AVAILABLE, count=55, updated_at="2026-10-19T08:00:00+00:00"))
+
+            # Error scenario: sensitive cookie in exception message
+            def failing_refresher(*args, **kwargs):
+                raise RuntimeError("Failed to auth with cookie session_token=SECRET_COOKIE_12345")
+
+            controller = TelegramController(
+                config_path,
+                config_loader=lambda _: cfg,
+                streak_refresher=failing_refresher,
+            )
+
+            update = FakeCallbackQueryUpdate(chat_id="123456789", data="streaks_refresh")
+
+            async def run_callback() -> None:
+                await controller.handle_callback(update, None)
+                tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+            asyncio.run(run_callback())
+
+            update.callback_query.edit_message_text.assert_called_once()
+            edited_text = update.callback_query.edit_message_text.call_args[0][0]
+
+            # Secret is NOT leaked
+            self.assertNotIn("SECRET_COOKIE_12345", edited_text)
+            self.assertNotIn("session_token", edited_text)
+
+            # Sanitized error is presented
+            self.assertIn("Phiên đăng nhập TikTok (cookie) không hợp lệ hoặc đã hết hạn.", edited_text)
+
+            # Previous cache is retained
+            self.assertIn("🔥 55 ngày", edited_text)
+            self.assertIn("bản cache gần nhất", edited_text)
 
     def test_run_cli_telegram_controller_validation(self) -> None:
         with TemporaryDirectory() as tmp_dir:
