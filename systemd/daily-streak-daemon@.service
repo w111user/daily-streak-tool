@@ -1,0 +1,20 @@
+[Unit]
+Description=Daily Streak Tool - TikTok Scheduled Sender Daemon (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=~
+EnvironmentFile=-%h/.config/daily-streak-tool/daemon.env
+EnvironmentFile=-%h/.config/daily-streak-tool/accounts/%i/daemon.env
+Environment="PATH=%h/.venvs/streak/bin:%h/Downloads/streak/.venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env streak --account %i --config %h/.config/daily-streak-tool/accounts/%i/config.json daemon
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

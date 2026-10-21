@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import abc
 import asyncio
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -73,6 +74,7 @@ class DaemonRunner:
         self,
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         *,
+        account_name: str | None = None,
         config_loader: ConfigLoader = load_config,
         sender_factory: SenderFactory = create_sender,
         lock: DaemonLock | None = None,
@@ -80,6 +82,7 @@ class DaemonRunner:
         pause_store: Any | None = None,
     ) -> None:
         self.config_path = Path(config_path)
+        self.account_name = str(account_name).strip() if account_name else None
         self.config_loader = config_loader
         self.sender_factory = sender_factory
         self.lock = lock
@@ -87,17 +90,24 @@ class DaemonRunner:
         self.pause_store = pause_store
         self._run_guard = asyncio.Lock()
 
+    @property
+    def _log_prefix(self) -> str:
+        return f"[{self.account_name}] " if self.account_name else ""
+
     async def run_once(self, *, check_pause: bool = True) -> RunSummary | None:
         """Load fresh configuration and run one batch unless a batch is active."""
 
         if self._run_guard.locked():
-            logger.warning("Skipping scheduled run because a prior run is still active.")
+            logger.warning("%sSkipping scheduled run because a prior run is still active.", self._log_prefix)
             return None
 
         async with self._run_guard:
-            config = self.config_loader(self.config_path)
+            raw_config = self.config_loader(self.config_path)
+            config = dict(raw_config)
+            if self.account_name and "account_name" not in config:
+                config["account_name"] = self.account_name
             if check_pause:
-                data_dir = get_data_dir(config)
+                data_dir = get_data_dir(config, account_name=self.account_name)
                 store = self.pause_store
                 if store is None:
                     from daily_streak.state import PauseStore
@@ -105,7 +115,8 @@ class DaemonRunner:
                 if store.is_paused():
                     info = store.get_pause_info()
                     logger.info(
-                        "Skipping scheduled run because daemon scheduler is paused (paused_at: %s, reason: %s)",
+                        "%sSkipping scheduled run because daemon scheduler is paused (paused_at: %s, reason: %s)",
+                        self._log_prefix,
                         info.get("paused_at"),
                         info.get("reason"),
                     )
@@ -114,7 +125,8 @@ class DaemonRunner:
             sender = self.sender_factory(config)
             summary = await sender.send_daily_links()
             logger.info(
-                "Sender run completed: %d success, %d failed, %d unconfirmed, %d skipped",
+                "%sSender run completed: %d success, %d failed, %d unconfirmed, %d skipped",
+                self._log_prefix,
                 summary.success_count,
                 summary.failed_count,
                 summary.unconfirmed_count,
@@ -134,7 +146,7 @@ class DaemonRunner:
                     try:
                         await notifier.batch_completion(summary)
                     except Exception:
-                        logger.exception("Failed to send batch completion notification")
+                        logger.exception("%sFailed to send batch completion notification", self._log_prefix)
             return summary
 
     async def run_forever(self, *, stop_event: asyncio.Event | None = None) -> None:
@@ -145,13 +157,16 @@ class DaemonRunner:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from apscheduler.triggers.cron import CronTrigger
 
-        initial_config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(initial_config)
+        initial_config = dict(self.config_loader(self.config_path))
+        if self.account_name and "account_name" not in initial_config:
+            initial_config["account_name"] = self.account_name
+        data_dir = get_data_dir(initial_config, account_name=self.account_name)
         daemon_lock = self.lock or DaemonLock(data_dir, config_path=self.config_path)
         daemon_lock.acquire()
 
         schedule = schedule_from_config(initial_config)
         scheduler = AsyncIOScheduler(timezone=schedule.timezone)
+        job_id = f"daily_tiktok_streak_sender_{self.account_name}" if self.account_name else "daily_tiktok_streak_sender"
         job = scheduler.add_job(
             self.run_once,
             CronTrigger(
@@ -159,15 +174,15 @@ class DaemonRunner:
                 minute=schedule.minute,
                 timezone=schedule.timezone,
             ),
-            id="daily_tiktok_streak_sender",
+            id=job_id,
             replace_existing=True,
             max_instances=1,
             misfire_grace_time=None,
             coalesce=True,
         )
         scheduler.start()
-        logger.info("Daemon started; scheduled daily run for %s %s", schedule.time_text, schedule.timezone)
-        logger.info("Next scheduled run: %s", job.next_run_time)
+        logger.info("%sDaemon started; scheduled daily run for %s %s", self._log_prefix, schedule.time_text, schedule.timezone)
+        logger.info("%sNext scheduled run: %s", self._log_prefix, job.next_run_time)
 
         stop_event = stop_event or asyncio.Event()
         remove_handlers = _install_stop_handlers(stop_event)
@@ -177,34 +192,44 @@ class DaemonRunner:
                 raw_schedule.get("run_on_start")
             )
             if run_on_start:
-                logger.info("Running sender immediately because schedule.run_on_start is enabled.")
+                logger.info("%sRunning sender immediately because schedule.run_on_start is enabled.", self._log_prefix)
                 try:
                     await self.run_once()
                 except Exception:
                     # An individual run must not take down a service that can
                     # recover on the next scheduled execution.
-                    logger.exception("Initial sender run failed")
+                    logger.exception("%sInitial sender run failed", self._log_prefix)
             await stop_event.wait()
             if self._run_guard.locked():
-                logger.info("Waiting for the active sender run to finish before shutdown.")
+                logger.info("%sWaiting for the active sender run to finish before shutdown.", self._log_prefix)
                 async with self._run_guard:
                     pass
         finally:
             scheduler.shutdown(wait=False)
             remove_handlers()
             daemon_lock.release()
-            logger.info("Daemon stopped")
+            logger.info("%sDaemon stopped", self._log_prefix)
 
 
 class DaemonManager:
     """Manage lifecycle, status, and logs of the detached background daemon."""
 
+    _start_locks_guard = threading.Lock()
+    _start_locks: dict[str, threading.Lock] = {}
     _start_lock = threading.Lock()
+
+    @classmethod
+    def _get_start_lock(cls, key: str) -> threading.Lock:
+        with cls._start_locks_guard:
+            if key not in cls._start_locks:
+                cls._start_locks[key] = threading.Lock()
+            return cls._start_locks[key]
 
     def __init__(
         self,
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         *,
+        account_name: str | None = None,
         config_loader: ConfigLoader = load_config,
         lock: DaemonLock | None = None,
         process_is_daemon: Callable[[int, str], bool] | None = None,
@@ -213,6 +238,7 @@ class DaemonManager:
         startup_timeout: float = 3.0,
     ) -> None:
         self.config_path = Path(config_path)
+        self.account_name = str(account_name).strip() if account_name else None
         self.config_loader = config_loader
         self._lock = lock
         self._process_is_daemon = process_is_daemon
@@ -220,6 +246,12 @@ class DaemonManager:
         self._popen_factory = popen_factory or subprocess.Popen
         self.startup_timeout = max(0.1, float(startup_timeout))
         self._process: Any = None
+        lock_key = (
+            f"{self.account_name}:{self.config_path.resolve()}"
+            if self.account_name
+            else str(self.config_path.resolve())
+        )
+        self._start_lock = self._get_start_lock(lock_key)
 
     def _get_lock(self, data_dir: Path) -> DaemonLock:
         return self._lock or DaemonLock(
@@ -231,7 +263,7 @@ class DaemonManager:
     def get_status(self) -> dict[str, Any]:
         """Return structured daemon status without blocking."""
         config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(config)
+        data_dir = get_data_dir(config, account_name=self.account_name)
         lock = self._get_lock(data_dir)
         metadata = lock.read_metadata()
         pid = metadata.get("pid")
@@ -272,7 +304,7 @@ class DaemonManager:
         elif not is_running and is_paused:
             status_text = "Stopped (Paused)"
 
-        return {
+        result = {
             "status": status_text,
             "is_running": is_running,
             "is_paused": is_paused,
@@ -285,6 +317,9 @@ class DaemonManager:
             "last_run": last_run,
             "log_path": log_path,
         }
+        if self.account_name:
+            result["account_name"] = self.account_name
+        return result
 
     def start(self, startup_timeout: float | None = None) -> int:
         """Start the background daemon process detached, returning its PID."""
@@ -298,7 +333,7 @@ class DaemonManager:
                 raise DaemonProcessError(f"Daemon is already running with PID {status['pid']}.")
 
             config = self.config_loader(self.config_path)
-            data_dir = get_data_dir(config)
+            data_dir = get_data_dir(config, account_name=self.account_name)
             data_dir.mkdir(parents=True, exist_ok=True)
             log_path = data_dir / DAEMON_LOG_FILENAME
 
@@ -334,10 +369,14 @@ class DaemonManager:
                 str(sys_executable),
                 "-m",
                 "daily_streak.cli",
+            ]
+            if self.account_name:
+                cmd.extend(["--account", self.account_name])
+            cmd.extend([
                 "--config",
                 str(abs_config_path),
                 "daemon",
-            ]
+            ])
 
             env = dict(os.environ)
             env["PYTHONUNBUFFERED"] = "1"
@@ -457,7 +496,7 @@ class DaemonManager:
     def stop(self, timeout: float = 10.0) -> bool:
         """Gracefully stop the running daemon without force-killing."""
         config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(config)
+        data_dir = get_data_dir(config, account_name=self.account_name)
         lock = self._get_lock(data_dir)
         metadata = lock.read_metadata()
         pid = metadata.get("pid")
@@ -502,7 +541,7 @@ class DaemonManager:
     def read_logs(self, max_lines: int = 100) -> list[str]:
         """Read a bounded tail of the daemon log file."""
         config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(config)
+        data_dir = get_data_dir(config, account_name=self.account_name)
         log_path = data_dir / DAEMON_LOG_FILENAME
         if not log_path.exists():
             return []
@@ -535,6 +574,305 @@ class DaemonManager:
             log_path.replace(dfn)
         except Exception as exc:
             logger.warning("Could not rotate daemon log: %s", exc)
+
+
+class DaemonService(abc.ABC):
+    """Abstract interface for managing daemon process lifecycle and pause state."""
+
+    @abc.abstractmethod
+    def get_status(self) -> dict[str, Any]:
+        """Return structured daemon status."""
+
+    @abc.abstractmethod
+    def start(self) -> int | None:
+        """Start the background daemon. Return PID if started or already active."""
+
+    @abc.abstractmethod
+    def stop(self) -> bool:
+        """Stop the background daemon. Return True if stopped or not running."""
+
+    @abc.abstractmethod
+    def pause(self, reason: str = "manual") -> None:
+        """Pause automated scheduled batches."""
+
+    @abc.abstractmethod
+    def resume(self) -> bool:
+        """Resume automated scheduled batches."""
+
+    @abc.abstractmethod
+    def is_paused(self) -> bool:
+        """Return True if automated runs are currently paused."""
+
+    @abc.abstractmethod
+    def get_pause_info(self) -> dict[str, Any]:
+        """Return pause metadata."""
+
+    def read_logs(self, max_lines: int = 100) -> list[str]:
+        """Return bounded daemon log lines."""
+        return []
+
+
+class ProcessDaemonManager(DaemonService):
+    """Daemon service adapter delegating to process-based DaemonManager."""
+
+    def __init__(
+        self,
+        config_path: str | Path = DEFAULT_CONFIG_PATH,
+        *,
+        account_name: str | None = None,
+        config_loader: ConfigLoader = load_config,
+        manager: DaemonManager | None = None,
+        pause_store: Any | None = None,
+    ) -> None:
+        self.config_path = Path(config_path)
+        self.account_name = str(account_name).strip() if account_name else None
+        self.config_loader = config_loader
+        self._manager = manager or DaemonManager(
+            self.config_path,
+            account_name=self.account_name,
+            config_loader=config_loader,
+        )
+        config = self.config_loader(self.config_path)
+        data_dir = get_data_dir(config, account_name=self.account_name)
+        if pause_store is not None:
+            self._pause_store = pause_store
+        else:
+            from daily_streak.state import PauseStore
+
+            self._pause_store = PauseStore(data_dir)
+
+    def get_status(self) -> dict[str, Any]:
+        status = self._manager.get_status()
+        status["backend"] = "process"
+        if self.account_name:
+            status["account_name"] = self.account_name
+        return status
+
+    def start(self) -> int | None:
+        status = self._manager.get_status()
+        if status.get("is_running"):
+            return status.get("pid")
+        return self._manager.start()
+
+    def stop(self) -> bool:
+        return self._manager.stop()
+
+    def pause(self, reason: str = "manual") -> None:
+        self._pause_store.pause(reason)
+
+    def resume(self) -> bool:
+        return self._pause_store.resume()
+
+    def is_paused(self) -> bool:
+        return self._pause_store.is_paused()
+
+    def get_pause_info(self) -> dict[str, Any]:
+        return self._pause_store.get_pause_info()
+
+    def read_logs(self, max_lines: int = 100) -> list[str]:
+        return self._manager.read_logs(max_lines=max_lines)
+
+
+class SystemdDaemonManager(DaemonService):
+    """Daemon service adapter controlling a systemd unit via systemctl."""
+
+    def __init__(
+        self,
+        config_path: str | Path = DEFAULT_CONFIG_PATH,
+        *,
+        account_name: str | None = None,
+        service_name: str | None = None,
+        scope: str = "user",
+        config_loader: ConfigLoader = load_config,
+        run_command: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        pause_store: Any | None = None,
+        now_provider: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.config_path = Path(config_path)
+        self.account_name = str(account_name).strip() if account_name else None
+        if service_name:
+            self.service_name = service_name
+        elif self.account_name:
+            self.service_name = f"daily-streak-daemon@{self.account_name}.service"
+        else:
+            self.service_name = "daily-streak-daemon.service"
+        self.scope = scope.strip().lower()
+        self.config_loader = config_loader
+        self._run_command = run_command or subprocess.run
+        config = self.config_loader(self.config_path)
+        data_dir = get_data_dir(config, account_name=self.account_name)
+        if pause_store is not None:
+            self._pause_store = pause_store
+        else:
+            from daily_streak.state import PauseStore
+
+            self._pause_store = PauseStore(data_dir)
+        self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
+
+    @property
+    def _cmd_prefix(self) -> list[str]:
+        return ["systemctl", "--user"] if self.scope == "user" else ["systemctl"]
+
+    def _exec_systemctl(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        cmd = self._cmd_prefix + args
+        try:
+            return self._run_command(cmd, capture_output=True, text=True, check=False)
+        except Exception as exc:
+            logger.error("Failed to execute systemctl command %s: %s", cmd, exc)
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=str(exc))
+
+    def _is_active(self) -> bool:
+        proc = self._exec_systemctl(["is-active", self.service_name])
+        return proc.returncode == 0 and proc.stdout.strip() == "active"
+
+    def _get_main_pid(self) -> int | None:
+        proc = self._exec_systemctl(["show", "--property=MainPID", "--value", self.service_name])
+        if proc.returncode == 0:
+            try:
+                pid = int(proc.stdout.strip())
+                return pid if pid > 0 else None
+            except ValueError:
+                pass
+        return None
+
+    def get_status(self) -> dict[str, Any]:
+        config = self.config_loader(self.config_path)
+        data_dir = get_data_dir(config, account_name=self.account_name)
+        is_running = self._is_active()
+        pid = self._get_main_pid() if is_running else None
+
+        schedule = schedule_from_config(config)
+        now_dt = self._now_provider()
+        local_now = (
+            now_dt.astimezone(schedule.timezone)
+            if now_dt.tzinfo
+            else now_dt.replace(tzinfo=timezone.utc).astimezone(schedule.timezone)
+        )
+        next_run_dt = next_run(schedule, local_now)
+        next_run_text = next_run_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        raw_schedule = config.get("schedule", {})
+        run_on_start = isinstance(raw_schedule, Mapping) and bool(raw_schedule.get("run_on_start"))
+
+        history_store = RunHistoryStore(data_dir)
+        records = history_store.load(limit=1)
+        last_run = records[0] if records else None
+
+        pause_info = self._pause_store.get_pause_info()
+        is_paused = bool(pause_info.get("paused"))
+
+        status_text = "Running" if is_running else "Stopped"
+        if is_running and is_paused:
+            status_text = "Running (Paused)"
+        elif not is_running and is_paused:
+            status_text = "Stopped (Paused)"
+
+        log_path = data_dir / DAEMON_LOG_FILENAME
+
+        result = {
+            "status": status_text,
+            "is_running": is_running,
+            "is_paused": is_paused,
+            "pause_info": pause_info,
+            "pid": pid,
+            "schedule_time": schedule.time_text,
+            "timezone": str(schedule.timezone),
+            "next_run": next_run_text,
+            "run_on_start": run_on_start,
+            "last_run": last_run,
+            "backend": f"systemd ({self.service_name})",
+            "scope": self.scope,
+            "log_path": log_path,
+        }
+        if self.account_name:
+            result["account_name"] = self.account_name
+        return result
+
+    def start(self) -> int | None:
+        if self._is_active():
+            return self._get_main_pid()
+        proc = self._exec_systemctl(["start", self.service_name])
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or f"systemctl exited with {proc.returncode}"
+            raise RuntimeError(f"Failed to start systemd service {self.service_name}: {err_msg}")
+        return self._get_main_pid()
+
+    def stop(self) -> bool:
+        if not self._is_active():
+            return True
+        proc = self._exec_systemctl(["stop", self.service_name])
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or f"systemctl exited with {proc.returncode}"
+            raise RuntimeError(f"Failed to stop systemd service {self.service_name}: {err_msg}")
+        return True
+
+    def pause(self, reason: str = "manual") -> None:
+        self._pause_store.pause(reason)
+
+    def resume(self) -> bool:
+        return self._pause_store.resume()
+
+    def is_paused(self) -> bool:
+        return self._pause_store.is_paused()
+
+    def get_pause_info(self) -> dict[str, Any]:
+        return self._pause_store.get_pause_info()
+
+    def read_logs(self, max_lines: int = 100) -> list[str]:
+        journal_cmd = ["journalctl", "--no-pager", "-u", self.service_name, "-n", str(max_lines)]
+        if self.scope == "user":
+            journal_cmd.insert(1, "--user")
+        try:
+            res = self._run_command(journal_cmd, capture_output=True, text=True, check=False)
+            if res.returncode == 0 and res.stdout.strip():
+                return [line.rstrip("\r\n") for line in res.stdout.splitlines()[-max_lines:]]
+        except Exception:
+            pass
+
+        config = self.config_loader(self.config_path)
+        data_dir = get_data_dir(config, account_name=self.account_name)
+        log_path = data_dir / DAEMON_LOG_FILENAME
+        if log_path.exists():
+            try:
+                with log_path.open("r", encoding="utf-8", errors="replace") as f:
+                    return [line.rstrip("\r\n") for line in f.readlines()[-max_lines:]]
+            except Exception:
+                pass
+        return []
+
+
+def create_daemon_service(
+    config: Mapping[str, Any],
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+    *,
+    account_name: str | None = None,
+    **kwargs: Any,
+) -> DaemonService:
+    """Instantiate the configured DaemonService backend (systemd or process)."""
+    raw_daemon = config.get("daemon", {})
+    daemon_cfg: Mapping[str, Any] = raw_daemon if isinstance(raw_daemon, Mapping) else {}
+
+    service_backend = str(daemon_cfg.get("service_backend", "")).strip().lower()
+    systemd_service = daemon_cfg.get("systemd_service")
+
+    account = account_name or config.get("account_name") or config.get("account")
+    account_str = str(account).strip() if account else None
+
+    if service_backend == "systemd" or (systemd_service and service_backend != "process"):
+        service_name = str(systemd_service) if systemd_service else None
+        scope = str(daemon_cfg.get("systemd_scope", "user"))
+        return SystemdDaemonManager(
+            config_path,
+            account_name=account_str,
+            service_name=service_name,
+            scope=scope,
+            **kwargs,
+        )
+    return ProcessDaemonManager(
+        config_path,
+        account_name=account_str,
+        **kwargs,
+    )
 
 
 def _install_stop_handlers(stop_event: asyncio.Event) -> Callable[[], None]:

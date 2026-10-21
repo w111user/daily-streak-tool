@@ -33,6 +33,7 @@ SenderFactory = Callable[[Mapping[str, Any]], Any]
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="streak", description="Daily Streak Tool v2 command line")
+    parser.add_argument("-a", "--account", default=None, help="Named account instance (e.g. account-1)")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging on stderr")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -55,6 +56,39 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--status", action="store_true", help="Check daemon status and exit")
     daemon.add_argument("--stop", action="store_true", help="Stop running background daemon")
     daemon.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
+
+    accounts = commands.add_parser("accounts", help="Manage named account instances")
+    account_commands = accounts.add_subparsers(dest="account_command", required=True)
+
+    acc_list = account_commands.add_parser("list", help="List all configured accounts")
+    acc_list.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
+
+    acc_create = account_commands.add_parser("create", help="Create a new named account instance")
+    acc_create.add_argument("name", help="Account name (alphanumeric, hyphens, underscores)")
+    acc_create.add_argument("--copy-from", default=None, help="Account name or config path to copy settings from")
+    acc_create.add_argument("--cookie-file", default=None, help="Path to cookies file for this account")
+    acc_create.add_argument("--schedule-time", default=None, help="Daily run time (HH:MM)")
+    acc_create.add_argument("--schedule-timezone", default=None, help="Schedule timezone (e.g. Asia/Ho_Chi_Minh)")
+    acc_create.add_argument("--run-on-start", action="store_true", help="Run sender immediately on daemon start")
+    acc_create.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
+
+    acc_status = account_commands.add_parser("status", help="Show status of accounts and daemon instances")
+    acc_status.add_argument("name", nargs="?", default=None, help="Account name (optional; shows all if omitted)")
+    acc_status.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
+
+    acc_start = account_commands.add_parser("start", help="Start background daemon for an account")
+    acc_start.add_argument("name", help="Account name to start daemon for")
+    acc_start.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
+
+    acc_stop = account_commands.add_parser("stop", help="Stop background daemon for an account")
+    acc_stop.add_argument("name", help="Account name to stop daemon for")
+    acc_stop.add_argument("--timeout", type=float, default=10.0, help="Stop timeout seconds (default: 10)")
+    acc_stop.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
+
+    acc_logs = account_commands.add_parser("logs", help="Tail daemon logs for an account")
+    acc_logs.add_argument("name", help="Account name")
+    acc_logs.add_argument("-n", "--lines", type=_positive_int, default=50, help="Number of log lines to show (default: 50)")
+    acc_logs.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON only on stdout")
 
     commands.add_parser("tui", help="Run the optional interactive Textual frontend")
     commands.add_parser("telegram-controller", help="Run the independent Telegram remote controller")
@@ -112,29 +146,51 @@ def run_cli(
     parser = build_parser()
     arguments = parser.parse_args(argv)
     _configure_logging(bool(arguments.verbose), stderr)
-    config_path = Path(arguments.config)
+
+    account_name = getattr(arguments, "account", None)
+    if account_name:
+        from daily_streak.accounts import AccountManager
+
+        raw_config_path = Path(arguments.config)
+        acc_mgr = AccountManager(base_dir=raw_config_path.parent, default_config_path=raw_config_path)
+        if arguments.config == str(DEFAULT_CONFIG_PATH):
+            try:
+                acc = acc_mgr.get_account(account_name)
+                config_path = acc.config_path
+            except ValueError:
+                config_path = acc_mgr.accounts_dir / account_name / "config.json"
+        else:
+            config_path = Path(arguments.config)
+    else:
+        config_path = Path(arguments.config)
+
+    def _load_and_tag_config(path: Path) -> dict[str, Any]:
+        cfg = load_config(path)
+        if account_name and "account_name" not in cfg:
+            cfg["account_name"] = account_name
+        return cfg
 
     try:
         if arguments.command == "doctor":
             return _run_doctor(config_path, bool(arguments.json_output), stdout)
         if arguments.command == "status":
-            config = load_config(config_path)
+            config = _load_and_tag_config(config_path)
             payload = status_payload(config)
             _write_payload(payload, bool(arguments.json_output), stdout, _format_status)
             return EXIT_OK
         if arguments.command == "history":
-            config = load_config(config_path)
-            records = RunHistoryStore(get_data_dir(config)).load(arguments.limit)
+            config = _load_and_tag_config(config_path)
+            records = RunHistoryStore(get_data_dir(config, account_name=account_name)).load(arguments.limit)
             payload = {"history": records}
             _write_payload(payload, bool(arguments.json_output), stdout, _format_history)
             return EXIT_OK
         if arguments.command == "videos":
-            config = load_config(config_path)
+            config = _load_and_tag_config(config_path)
             videos = configured_videos(config)
             _write_payload({"videos": videos}, bool(arguments.json_output), stdout, _format_videos)
             return EXIT_OK
         if arguments.command == "recipients":
-            config = load_config(config_path)
+            config = _load_and_tag_config(config_path)
             show_streaks = bool(getattr(arguments, "show_streaks", False))
             if arguments.recipient_command == "list":
                 recipients = configured_recipients(config)
@@ -148,7 +204,7 @@ def run_cli(
             if show_streaks and arguments.recipient_command != "refresh-streaks":
                 from daily_streak.streak_reader import StreakCache, format_streak_display
 
-                cache = StreakCache(get_data_dir(config))
+                cache = StreakCache(get_data_dir(config, account_name=account_name))
                 enriched: list[dict[str, Any]] = []
                 for item in recipients:
                     row = dict(item)
@@ -164,7 +220,7 @@ def run_cli(
             return EXIT_OK
 
         if arguments.command == "send":
-            config = load_config(config_path)
+            config = _load_and_tag_config(config_path)
             summary = asyncio.run(_run_send(config, bool(arguments.force), sender_factory))
             _write_payload(summary_to_payload(summary), bool(arguments.json_output), stdout, _format_summary)
             if summary.setup_error:
@@ -172,10 +228,10 @@ def run_cli(
             return EXIT_RECIPIENT_FAILURES if (summary.failed_count or summary.unconfirmed_count) else EXIT_OK
         if arguments.command == "daemon":
             if getattr(arguments, "status", False):
-                config = load_config(config_path)
+                config = _load_and_tag_config(config_path)
                 from daily_streak.daemon import DaemonManager
 
-                mgr = DaemonManager(config_path)
+                mgr = DaemonManager(config_path, account_name=account_name)
                 status = mgr.get_status()
                 payload = {
                     "status": status["status"],
@@ -186,19 +242,104 @@ def run_cli(
                     "run_on_start": status["run_on_start"],
                     "last_run": status["last_run"],
                 }
+                if account_name:
+                    payload["account_name"] = account_name
                 _write_payload(payload, bool(arguments.json_output), stdout, _format_daemon_status)
                 return EXIT_OK
             if getattr(arguments, "stop", False):
                 from daily_streak.daemon import DaemonManager
 
-                mgr = DaemonManager(config_path)
+                mgr = DaemonManager(config_path, account_name=account_name)
                 stopped = mgr.stop()
                 if stopped:
                     print("Daemon stopped.", file=stdout)
                     return EXIT_OK
                 print("Stop signal sent; daemon may be finishing an in-progress batch.", file=stdout)
                 return EXIT_OK
-            return asyncio.run(_run_daemon(config_path, sender_factory))
+            return asyncio.run(_run_daemon(config_path, sender_factory, account_name=account_name))
+        if arguments.command == "accounts":
+            from daily_streak.accounts import AccountManager
+
+            mgr = AccountManager(base_dir=config_path.parent, default_config_path=config_path)
+            if arguments.account_command == "list":
+                accounts = mgr.list_accounts(include_default=True)
+                payload = {
+                    "accounts": [
+                        {
+                            "name": acc.name,
+                            "config_path": str(acc.config_path),
+                            "data_dir": str(acc.data_dir),
+                            "cookie_file": str(acc.cookie_file) if acc.cookie_file else None,
+                            "schedule_time": acc.schedule_time,
+                            "schedule_timezone": acc.schedule_timezone,
+                            "enabled": acc.enabled,
+                        }
+                        for acc in accounts
+                    ]
+                }
+                _write_payload(payload, bool(arguments.json_output), stdout, _format_accounts)
+                return EXIT_OK
+            if arguments.account_command == "create":
+                acc = mgr.create_account(
+                    arguments.name,
+                    copy_from=arguments.copy_from,
+                    cookie_file=arguments.cookie_file,
+                    schedule_time=arguments.schedule_time,
+                    schedule_timezone=arguments.schedule_timezone,
+                    run_on_start=arguments.run_on_start,
+                )
+                payload = {
+                    "created": True,
+                    "account": {
+                        "name": acc.name,
+                        "config_path": str(acc.config_path),
+                        "data_dir": str(acc.data_dir),
+                        "cookie_file": str(acc.cookie_file) if acc.cookie_file else None,
+                    },
+                }
+                if bool(arguments.json_output):
+                    _write_payload(payload, True, stdout, lambda _: "")
+                else:
+                    print(f"Created account '{acc.name}' at {acc.config_path}", file=stdout)
+                return EXIT_OK
+            if arguments.account_command == "status":
+                if arguments.name:
+                    status = mgr.get_status(arguments.name)
+                    statuses = [status]
+                else:
+                    statuses = mgr.get_all_statuses()
+                conflicts = mgr.check_conflicts()
+                payload = {"statuses": statuses, "conflicts": conflicts}
+                _write_payload(payload, bool(arguments.json_output), stdout, _format_account_status)
+                return EXIT_OK
+            if arguments.account_command == "start":
+                pid = mgr.start_daemon(arguments.name)
+                payload = {"started": True, "account": arguments.name, "pid": pid}
+                if bool(arguments.json_output):
+                    _write_payload(payload, True, stdout, lambda _: "")
+                else:
+                    print(f"Daemon for account '{arguments.name}' started with PID {pid}.", file=stdout)
+                return EXIT_OK
+            if arguments.account_command == "stop":
+                stopped = mgr.stop_daemon(arguments.name, timeout=getattr(arguments, "timeout", 10.0))
+                payload = {"stopped": stopped, "account": arguments.name}
+                if bool(arguments.json_output):
+                    _write_payload(payload, True, stdout, lambda _: "")
+                else:
+                    if stopped:
+                        print(f"Daemon for account '{arguments.name}' stopped.", file=stdout)
+                    else:
+                        print(f"Stop signal sent to account '{arguments.name}'; daemon may be finishing an in-progress batch.", file=stdout)
+                return EXIT_OK
+            if arguments.account_command == "logs":
+                lines = mgr.read_logs(arguments.name, max_lines=arguments.lines)
+                payload = {"account": arguments.name, "logs": lines}
+                if bool(arguments.json_output):
+                    _write_payload(payload, True, stdout, lambda _: "")
+                else:
+                    for line in lines:
+                        print(line, file=stdout)
+                return EXIT_OK
         if arguments.command == "tui":
             # Validate configuration before starting terminal takeover, but
             # defer importing the optional TUI package until this command.
@@ -206,6 +347,8 @@ def run_cli(
             from daily_streak.tui import TuiUnavailableError, run_tui
 
             try:
+                if account_name:
+                    return run_tui(config_path, account_name=account_name)
                 return run_tui(config_path)
             except TuiUnavailableError as exc:
                 _write_error(stderr, str(exc))
@@ -347,12 +490,18 @@ async def _run_send(
     return await sender.send_daily_links(force=force)
 
 
-async def _run_daemon(config_path: Path, sender_factory: SenderFactory | None) -> int:
+async def _run_daemon(
+    config_path: Path,
+    sender_factory: SenderFactory | None,
+    *,
+    account_name: str | None = None,
+) -> int:
     from daily_streak.daemon import DaemonRunner
     from daily_streak.lock import DaemonLockedError
 
     runner = DaemonRunner(
         config_path,
+        account_name=account_name,
         sender_factory=sender_factory or _default_sender_factory(),
     )
     try:
@@ -644,6 +793,52 @@ def _format_videos(payload: Mapping[str, object]) -> str:
     if not isinstance(videos, list) or not videos:
         return "No videos configured."
     return "\n".join(f"{index}. {video}" for index, video in enumerate(videos, start=1))
+
+
+def _format_accounts(payload: Mapping[str, object]) -> str:
+    accounts = payload.get("accounts", [])
+    if not isinstance(accounts, list) or not accounts:
+        return "No accounts configured."
+    lines = ["Configured Accounts:", ""]
+    for acc in accounts:
+        if isinstance(acc, Mapping):
+            name = acc.get("name", "unknown")
+            cfg = acc.get("config_path", "")
+            cookie = acc.get("cookie_file") or "none"
+            lines.append(f"- {name} (config: {cfg}, cookies: {cookie})")
+    return "\n".join(lines)
+
+
+def _format_account_status(payload: Mapping[str, object]) -> str:
+    statuses = payload.get("statuses", [])
+    conflicts = payload.get("conflicts", [])
+    lines = ["Multi-Account Daemon Status:", ""]
+    if isinstance(statuses, list):
+        for st in statuses:
+            if isinstance(st, Mapping):
+                acc_name = st.get("account_name", "unknown")
+                status = st.get("status", "Stopped")
+                pid = st.get("pid")
+                pid_text = f" (PID {pid})" if pid else ""
+                sched = f"{st.get('schedule_time')} ({st.get('timezone')})"
+                next_r = st.get("next_run", "N/A")
+                lines.append(f"Account: {acc_name}")
+                lines.append(f"  Status:    {status}{pid_text}")
+                lines.append(f"  Schedule:  {sched}")
+                lines.append(f"  Next run:  {next_r}")
+                last_run = st.get("last_run")
+                if isinstance(last_run, Mapping):
+                    lines.append(
+                        f"  Last run:  {last_run.get('success', 0)} success, "
+                        f"{last_run.get('failed', 0)} failed, {last_run.get('unconfirmed', 0)} unconfirmed"
+                    )
+                lines.append("")
+    if isinstance(conflicts, list) and conflicts:
+        lines.append("Warnings / Conflicts:")
+        for cf in conflicts:
+            if isinstance(cf, Mapping):
+                lines.append(f"  ! {cf.get('message')}")
+    return "\n".join(lines).rstrip()
 
 
 def _configure_logging(verbose: bool, stderr: TextIO) -> None:

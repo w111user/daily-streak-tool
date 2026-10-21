@@ -143,7 +143,7 @@ pip install -e '.[tui,telegram,desktop]'
 > - `desktop`: Cài đặt `plyer>=2.1.0` để hiển thị popup thông báo trên desktop.
 > - `windows`: Cài đặt `pywin32>=306` (chỉ dành cho hệ điều hành Windows).
 >
-> 💡 **Về `requirements.txt` và `pyproject.toml`:** Dự án tuân thủ chuẩn PEP 517/621, sử dụng `pyproject.toml` làm nguồn chân lý duy nhất (single source of truth) cho các dependency và extras. File `requirements.txt` được giữ lại nhằm đảm bảo tương thích ngược với các workflow cài đặt truyền thống (`pip install -r requirements.txt`). Khuyến nghị dùng `pip install -e '.[tui,telegram]'` cho các môi trường phát triển mã nguồn, hoặc `pip install "./daily_streak_tool-2.2.0-py3-none-any.whl[telegram]"` khi triển khai wheel trên server độc lập.
+> 💡 **Về `requirements.txt` và `pyproject.toml`:** Dự án tuân thủ chuẩn PEP 517/621, sử dụng `pyproject.toml` làm nguồn chân lý duy nhất (single source of truth) cho các dependency và extras. File `requirements.txt` được giữ lại nhằm đảm bảo tương thích ngược với các workflow cài đặt truyền thống (`pip install -r requirements.txt`). Khuyến nghị dùng `pip install -e '.[tui,telegram]'` cho các môi trường phát triển mã nguồn, hoặc `pip install "./daily_streak_tool-2.3.0-py3-none-any.whl[telegram]"` khi triển khai wheel trên server độc lập.
 
 
 ### Bước 3: Cài đặt trình duyệt cho Playwright (nếu không dùng Chrome hệ thống)
@@ -407,16 +407,11 @@ Daemon chịu trách nhiệm chạy các đợt gửi tự động theo giờ đ
 
 Dự án cung cấp sẵn template `systemd/daily-streak-daemon.service`.
 
-#### 1. Chọn layout triển khai:
-- **Layout A — Production (Mặc định trong template):**
-  Dành cho môi trường cài package trong virtualenv tập trung:
-  - Executable: `~/.venvs/streak/bin/streak` (specifier `%h/.venvs/streak/bin/streak`)
-  - Thư mục làm việc & Config: `~/.config/daily-streak-tool/config.json`
-- **Layout B — Source checkout (Nhà phát triển / Clone repo):**
-  Nếu bạn clone repo về máy (ví dụ `~/daily-streak-tool`) và tạo virtualenv cục bộ:
-  - Thay đổi đường dẫn trong file service thành:
-    - `WorkingDirectory=%h/daily-streak-tool`
-    - `ExecStart=%h/daily-streak-tool/.venv/bin/streak --config %h/daily-streak-tool/config.json daemon`
+#### 1. Cơ chế đường dẫn thực thi:
+Các file service sử dụng `ExecStart=/usr/bin/env streak ...` kết hợp khai báo `PATH` linh hoạt trong `Environment`:
+- Tự động nhận diện executable `streak` trong virtualenv tập trung (`~/.venvs/streak/bin`), source checkout (`~/Downloads/streak/.venv/bin`), hoặc user bin (`~/.local/bin`, `/usr/local/bin`).
+- Thư mục cấu hình chuẩn: `~/.config/daily-streak-tool/config.json`.
+- Nếu có cấu hình biến môi trường hoặc đường dẫn `PATH` riêng biệt, bạn có thể định nghĩa trong `~/.config/daily-streak-tool/daemon.env` (systemd tự động nạp mà không cần sửa file `.service`).
 
 #### 2. Kích hoạt service:
 ```bash
@@ -437,6 +432,55 @@ systemctl --user enable --now daily-streak-daemon.service
 
 > ⚠️ **CHÚ Ý VỀ `schedule.run_on_start`:** Khi daemon khởi động, nếu `config.json` có `"run_on_start": true`, hệ thống sẽ **gửi tin nhắn TikTok ngay lập tức** cho các người nhận chưa hoàn thành trong ngày thay vì đợi đến giờ hẹn. Hãy kiểm tra kỹ giá trị này trước khi bật service.
 > 💡 **Mẹo:** Nếu bạn sử dụng cả tính năng **Telegram Remote Controller** để điều khiển từ xa, hãy xem hướng dẫn thiết lập trọn bộ 2 service tại [Mục 14](#14-điều-khiển-từ-xa-qua-telegram--telegram-remote-controller).
+
+### Vận hành nhiều tài khoản độc lập (Multi-Account Daemon Management):
+
+Từ phiên bản v2.3.0, công cụ hỗ trợ quản lý nhiều tài khoản TikTok gửi độc lập trên cùng một máy chủ:
+- Mỗi tài khoản có file cấu hình `accounts/<tên>/config.json`, file cookie riêng biệt `accounts/<tên>/cookies.json`, và profile Chromium riêng biệt.
+- Dữ liệu runtime (locks `daemon.lock`, `send.lock`, nhật ký ngày `daily-state.json`, lịch sử `history.jsonl`, và bộ nhớ đệm `streaks.json`) hoàn toàn cách ly trong thư mục `<data_dir>/accounts/<tên>/`.
+- Thao tác trên tài khoản A không bao giờ ảnh hưởng, khóa hoặc làm dừng tài khoản B.
+
+#### 1. Quản lý tài khoản qua CLI:
+```bash
+# Xem danh sách các tài khoản hiện có
+streak accounts list
+
+# Tạo tài khoản mới với giờ gửi riêng
+streak accounts create account-1 --schedule-time 08:30 --schedule-timezone Asia/Ho_Chi_Minh
+
+# Kiểm tra trạng thái toàn bộ các tài khoản
+streak accounts status
+
+# Khởi động / dừng daemon của một tài khoản cụ thể
+streak accounts start account-1
+streak accounts stop account-1
+
+# Xem log của một tài khoản
+streak accounts logs account-1
+```
+
+#### 2. Quản lý qua TUI Dashboard:
+Giao diện TUI (`streak tui`) hiển thị bảng điều khiển tài khoản tại tab **Daemon**, cho phép xem trạng thái của tất cả các tài khoản, PID, lịch gửi và chuyển đổi ngữ cảnh tài khoản ngay trong một phiên làm việc.
+
+#### 3. Chạy nhiều Daemon qua Systemd Template:
+Dự án cung cấp template systemd `systemd/daily-streak-daemon@.service`:
+```bash
+# Copy template vào thư mục systemd user
+cp systemd/daily-streak-daemon@.service ~/.config/systemd/user/
+chmod 644 ~/.config/systemd/user/daily-streak-daemon@.service
+
+# Nạp lại systemd
+systemctl --user daemon-reload
+
+# Kích hoạt và khởi động daemon cho từng tài khoản độc lập
+systemctl --user enable --now daily-streak-daemon@account-1.service
+systemctl --user enable --now daily-streak-daemon@account-2.service
+
+# Kiểm tra trạng thái và log của từng tài khoản
+systemctl --user status daily-streak-daemon@account-1.service
+journalctl --user -u daily-streak-daemon@account-1.service -f
+```
+*(Nếu cần cấu hình biến môi trường hoặc đường dẫn `PATH` riêng, bạn có thể tạo file `~/.config/daily-streak-tool/accounts/<tên>/daemon.env`)*.
 
 ---
 
@@ -470,7 +514,7 @@ Khi cài đặt extra `telegram`, bạn có thể nhận thông báo tức thờ
 pip install -e '.[telegram]'
 
 # Hoặc khi cài đặt từ file wheel (.whl) trên máy chủ:
-pip install "./daily_streak_tool-2.2.0-py3-none-any.whl[telegram]"
+pip install "./daily_streak_tool-2.3.0-py3-none-any.whl[telegram]"
 ```
 
 ### Các sự kiện gửi thông báo:
@@ -534,15 +578,8 @@ Dự án cung cấp sẵn hai file service unit trong thư mục `systemd/`:
 
 Cả hai service đều được thiết kế dưới dạng **systemd user service** (chạy dưới quyền user thường, không cần quyền root hay `sudo`).
 
-#### Hai layout triển khai:
-- **Layout A — Production (Mặc định trong template):**
-  Dành cho môi trường cài package trong virtualenv tập trung:
-  - Executable: `~/.venvs/streak/bin/streak` (`%h/.venvs/streak/bin/streak`)
-  - Config: `~/.config/daily-streak-tool/config.json` (`%h/.config/daily-streak-tool/config.json`)
-  - WorkingDirectory: `~/.config/daily-streak-tool` (`%h/.config/daily-streak-tool`)
-- **Layout B — Source checkout (Dành cho nhà phát triển / Clone repo):**
-  Nếu bạn chạy trực tiếp từ thư mục mã nguồn clone về (ví dụ `~/daily-streak-tool`):
-  - Chỉnh sửa `WorkingDirectory` và `ExecStart` trong cả 2 file `.service` để trỏ vào virtualenv và config cục bộ (ví dụ `WorkingDirectory=%h/daily-streak-tool`, `ExecStart=%h/daily-streak-tool/.venv/bin/streak --config %h/daily-streak-tool/config.json daemon` và `telegram-controller`).
+#### Cơ chế đường dẫn thực thi:
+Các file service sử dụng `ExecStart=/usr/bin/env streak ...` kết hợp `PATH` linh hoạt hỗ trợ sẵn cả Virtualenv tập trung (`~/.venvs/streak/bin`), Source checkout (`~/Downloads/streak/.venv/bin`, `~/.local/bin`), hoặc tùy biến qua file `~/.config/daily-streak-tool/daemon.env` mà không cần chỉnh sửa thủ công file unit.
 
 #### Các bước cài đặt:
 ```bash

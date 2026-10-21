@@ -142,13 +142,34 @@ def get_user_data_dir(
     tiktok_config: Mapping[str, Any],
     *,
     system: str | None = None,
+    account_name: str | None = None,
 ) -> Path:
-    """Resolve the configured platform profile path without creating it."""
+    """Resolve the configured platform profile path without creating it.
+
+    When ``account_name`` is supplied (or present in ``tiktok_config``),
+    the profile path is isolated under an ``accounts/<name>`` subpath.
+    """
+
+    account = account_name
+    if account is None:
+        raw_account = tiktok_config.get("account_name") or tiktok_config.get("account")
+        if raw_account:
+            account = str(raw_account).strip()
 
     configured_path = tiktok_config.get(get_user_data_dir_key(system))
     if configured_path:
-        return Path(str(configured_path)).expanduser()
-    return Path(get_default_user_data_dir(system)).expanduser()
+        base_dir = Path(str(configured_path)).expanduser()
+    else:
+        base_dir = Path(get_default_user_data_dir(system)).expanduser()
+
+    if account and account != "default":
+        clean_account = str(account).strip()
+        if clean_account and clean_account != "default":
+            if base_dir.name == clean_account or (len(base_dir.parts) >= 2 and base_dir.parts[-2:] == ("accounts", clean_account)):
+                return base_dir
+            return base_dir / "accounts" / clean_account
+
+    return base_dir
 
 
 def _candidate_browser_paths(system: str) -> tuple[Path, ...]:
@@ -381,9 +402,14 @@ def get_persistent_context(config: Mapping[str, Any]) -> bool:
     return bool(value)
 
 
-def get_browser_launch_config(config: Mapping[str, Any]) -> BrowserLaunchConfig:
+def get_browser_launch_config(
+    config: Mapping[str, Any],
+    *,
+    account_name: str | None = None,
+) -> BrowserLaunchConfig:
     """Resolve all common persistent Chromium launch settings from config."""
 
+    account = account_name or config.get("account_name") or config.get("account")
     tiktok_config = _tiktok_config(config)
     preferred_executable = tiktok_config.get("browser_executable") or tiktok_config.get(
         "executable_path"
@@ -391,7 +417,11 @@ def get_browser_launch_config(config: Mapping[str, Any]) -> BrowserLaunchConfig:
     low_memory_mode = get_low_memory_mode(config)
     persistent_context = get_persistent_context(config)
     return BrowserLaunchConfig(
-        user_data_dir=(get_user_data_dir(tiktok_config) if persistent_context else None),
+        user_data_dir=(
+            get_user_data_dir(tiktok_config, account_name=account)
+            if persistent_context
+            else None
+        ),
         executable_path=discover_browser_executable(preferred_executable),
         headless=bool(tiktok_config.get("headless", False)),
         args=_configured_browser_args(tiktok_config, low_memory_mode=low_memory_mode),

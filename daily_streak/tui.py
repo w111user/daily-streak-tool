@@ -68,6 +68,8 @@ class TuiController:
         self,
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         *,
+        account_name: str | None = None,
+        account_manager: Any | None = None,
         config_loader: Callable[[str | Path], dict[str, Any]] = load_config,
         config_saver: Callable[[Mapping[str, Any], str | Path], None] = save_config,
         sender_factory: TuiSenderFactory | None = None,
@@ -83,12 +85,31 @@ class TuiController:
         self.scan_action = scan_action or _scan_recipients
         self.resolve_action = resolve_action or _resolve_recipients
         self.notifier_factory = notifier_factory
+
+        if account_manager is not None:
+            self.account_manager = account_manager
+        else:
+            from daily_streak.accounts import AccountManager
+
+            self.account_manager = AccountManager(
+                base_dir=self.config_path.parent,
+                default_config_path=self.config_path,
+                config_loader=self.config_loader,
+                config_saver=self.config_saver,
+            )
+
+        self.active_account_name = str(account_name).strip() if account_name else None
+
         if daemon_manager is not None:
             self.daemon_manager = daemon_manager
         else:
             from daily_streak.daemon import DaemonManager
 
-            self.daemon_manager = DaemonManager(self.config_path, config_loader=self.config_loader)
+            self.daemon_manager = DaemonManager(
+                self.config_path,
+                account_name=self.active_account_name,
+                config_loader=self.config_loader,
+            )
         self.config: dict[str, Any] = {}
         self._catalog: list[_CatalogRecipient] = []
         self.current_results: list[RecipientResult] = []
@@ -96,27 +117,73 @@ class TuiController:
         self._progress_callback: Callable[[RecipientResult, RunSummary], None] | None = None
         self.reload()
 
-    def daemon_status(self) -> dict[str, Any]:
+    def list_accounts(self) -> list[Any]:
+        """Return discovered account instances."""
+        return self.account_manager.list_accounts(include_default=False)
+
+    def check_conflicts(self) -> list[dict[str, Any]]:
+        """Return cross-account conflicts and warnings."""
+        return self.account_manager.check_conflicts()
+
+    def select_account(self, name: str) -> None:
+        """Switch active account and reload configuration, catalog, and daemon manager."""
+        if name in ("default", ""):
+            self.active_account_name = None
+            self.config_path = self.account_manager.default_config_path
+            from daily_streak.daemon import DaemonManager
+
+            self.daemon_manager = DaemonManager(
+                self.config_path,
+                account_name=None,
+                config_loader=self.config_loader,
+            )
+            self.reload()
+            return
+
+        account = self.account_manager.get_account(name)
+        self.active_account_name = account.name
+        self.config_path = account.config_path
+        from daily_streak.daemon import DaemonManager
+
+        self.daemon_manager = DaemonManager(
+            self.config_path,
+            account_name=account.name,
+            config_loader=self.config_loader,
+        )
+        self.reload()
+
+    def daemon_status(self, account_name: str | None = None) -> dict[str, Any]:
         """Return structured daemon status from the daemon manager."""
+        if account_name and account_name != self.active_account_name:
+            return self.account_manager.get_status(account_name)
         return self.daemon_manager.get_status()
 
-    def daemon_logs(self, max_lines: int = 100) -> list[str]:
+    def daemon_logs(self, account_name: str | None = None, max_lines: int = 100) -> list[str]:
         """Return recent bounded log lines from the daemon log file."""
+        if account_name and account_name != self.active_account_name:
+            return self.account_manager.read_logs(account_name, max_lines=max_lines)
         return self.daemon_manager.read_logs(max_lines=max_lines)
 
-    def start_daemon(self) -> int:
+    def start_daemon(self, account_name: str | None = None) -> int:
         """Start the background daemon process."""
+        if account_name and account_name != self.active_account_name:
+            return self.account_manager.start_daemon(account_name)
         return self.daemon_manager.start()
 
-    def stop_daemon(self, timeout: float = 10.0) -> bool:
+    def stop_daemon(self, account_name: str | None = None, timeout: float = 10.0) -> bool:
         """Stop the background daemon process gracefully."""
+        if account_name and account_name != self.active_account_name:
+            return self.account_manager.stop_daemon(account_name, timeout=timeout)
         return self.daemon_manager.stop(timeout=timeout)
 
     def reload(self) -> None:
         """Refresh configuration, dashboard state, history, and selected recipients."""
 
-        self.config = self.config_loader(self.config_path)
-        self.streak_cache = StreakCache(get_data_dir(self.config))
+        raw_cfg = self.config_loader(self.config_path)
+        self.config = dict(raw_cfg)
+        if self.active_account_name and "account_name" not in self.config:
+            self.config["account_name"] = self.active_account_name
+        self.streak_cache = StreakCache(get_data_dir(self.config, account_name=self.active_account_name))
         # Configured recipients are the initial catalog, not merely a detached
         # selection set.  This makes their rows render before any browser scan.
         self._catalog = [
@@ -132,7 +199,7 @@ class TuiController:
     def history(self, limit: int = 20) -> list[dict[str, Any]]:
         """Read history through the shared durable history store."""
 
-        return RunHistoryStore(get_data_dir(self.config)).load(limit)
+        return RunHistoryStore(get_data_dir(self.config, account_name=self.active_account_name)).load(limit)
 
     def history_rows(self, limit: int = 20) -> list[dict[str, object]]:
         """Return formatted history rows for rendering, with legacy fallback."""
@@ -427,10 +494,14 @@ class _TuiLogHandler(logging.Handler):
             pass
 
 
-def run_tui(config_path: str | Path = DEFAULT_CONFIG_PATH) -> int:
+def run_tui(
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+    *,
+    account_name: str | None = None,
+) -> int:
     """Run the optional Textual app, importing Textual only at invocation time."""
 
-    app = create_tui_app(config_path)
+    app = create_tui_app(config_path, account_name=account_name)
     app.run()
     return 0
 
@@ -438,6 +509,8 @@ def run_tui(config_path: str | Path = DEFAULT_CONFIG_PATH) -> int:
 def create_tui_app(
     config_path: str | Path = DEFAULT_CONFIG_PATH,
     controller: TuiController | None = None,
+    *,
+    account_name: str | None = None,
 ) -> Any:
     """Create the concrete Textual app while keeping module import dependency-free."""
 
@@ -462,7 +535,7 @@ def create_tui_app(
             ) from exc
         raise
 
-    controller = controller or TuiController(config_path)
+    controller = controller or TuiController(config_path, account_name=account_name)
 
     class StreakTui(App[None]):
         """Interactive dashboard; it holds no browser resources while idle."""
@@ -475,6 +548,8 @@ def create_tui_app(
         #logs-panel { height: 14; }
         #logs { height: 1fr; border: solid $primary; padding: 0 1; }
         TabbedContent { height: 1fr; }
+        #daemon-account-banner { height: 1; padding: 0 2; text-style: bold; color: $text; }
+        #daemon-accounts-table { height: 6; margin: 0 0 1 0; }
         #daemon-info { height: auto; padding: 1 2; }
         #daemon-buttons { height: 3; padding: 0 2; margin: 1 0; }
         #daemon-buttons Button { margin-right: 1; }
@@ -518,6 +593,8 @@ def create_tui_app(
                 with TabPane("History", id="history-tab"):
                     yield DataTable(id="history")
                 with TabPane("Daemon", id="daemon-tab"):
+                    yield Static("Active Account: ...", id="daemon-account-banner")
+                    yield DataTable(id="daemon-accounts-table")
                     yield Static(id="daemon-info")
                     with Horizontal(id="daemon-buttons"):
                         yield Button("Start Daemon", id="btn-start-daemon", variant="success")
@@ -540,12 +617,34 @@ def create_tui_app(
             self.query_one("#history", DataTable).add_columns(
                 "Finished", "Success", "Failed", "Unconfirmed", "Skipped"
             )
+            self.query_one("#daemon-accounts-table", DataTable).add_columns(
+                "Account", "Status", "PID", "Next Run", "Schedule", "Last Batch"
+            )
 
             self._log_handler = _TuiLogHandler(self)
             self._log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
             logging.getLogger().addHandler(self._log_handler)
             self.controller.set_progress_callback(self._on_recipient_result)
             self._render_all()
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            if event.data_table.id == "daemon-accounts-table":
+                self._switch_account_by_index(event.cursor_row)
+
+        def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+            if event.data_table.id == "daemon-accounts-table":
+                self._switch_account_by_index(event.coordinate.row)
+
+        def _switch_account_by_index(self, row_index: int) -> None:
+            if self._busy():
+                return
+            accounts = self.controller.list_accounts()
+            if 0 <= row_index < len(accounts):
+                target_name = accounts[row_index].name
+                if target_name != self.controller.active_account_name:
+                    self.controller.select_account(target_name)
+                    self._run_status = f"Active account switched to '{target_name}'."
+                    self._render_all()
 
         def on_unmount(self) -> None:
             if self._log_handler is not None:
@@ -742,6 +841,50 @@ def create_tui_app(
 
         def _render_daemon(self) -> None:
             status = self.controller.daemon_status()
+            active_name = self.controller.active_account_name or "default"
+            cfg_name = self.controller.config_path.name
+
+            # Account banner
+            try:
+                banner = self.query_one("#daemon-account-banner", Static)
+                banner.update(f"Active Account: {active_name}  ({cfg_name})")
+            except Exception:
+                pass
+
+            # Accounts table
+            try:
+                table = self.query_one("#daemon-accounts-table", DataTable)
+                table.clear(columns=False)
+                accounts = self.controller.list_accounts()
+                for acc in accounts:
+                    acc_status = self.controller.daemon_status(acc.name)
+                    marker = "▶ " if acc.name == active_name else "  "
+                    pid_disp = str(acc_status.get("pid") or "-")
+                    last_run_item = acc_status.get("last_run")
+                    if isinstance(last_run_item, Mapping):
+                        last_str = f"{last_run_item.get('success', 0)} ok, {last_run_item.get('failed', 0)} fail"
+                    else:
+                        last_str = "None"
+                    table.add_row(
+                        f"{marker}{acc.name}",
+                        str(acc_status.get("status", "Stopped")),
+                        pid_disp,
+                        str(acc_status.get("next_run", "N/A")),
+                        f"{acc.schedule_time} ({acc.schedule_timezone})",
+                        last_str,
+                    )
+            except Exception:
+                pass
+
+            # Action buttons label
+            try:
+                btn_start = self.query_one("#btn-start-daemon", Button)
+                btn_stop = self.query_one("#btn-stop-daemon", Button)
+                btn_start.label = f"Start Daemon ({active_name})"
+                btn_stop.label = f"Stop Daemon ({active_name})"
+            except Exception:
+                pass
+
             lines = [
                 f"Daemon Status:       {status['status']}" + (f" (PID: {status['pid']})" if status.get("pid") else ""),
                 f"Configured Schedule: {status['schedule_time']} ({status['timezone']})",
@@ -758,6 +901,13 @@ def create_tui_app(
                 )
             else:
                 lines.append("Last Batch Outcome:  No runs recorded yet.")
+
+            conflicts = self.controller.check_conflicts()
+            if conflicts:
+                lines.append("")
+                lines.append("Multi-Account Warnings / Conflicts:")
+                for cf in conflicts:
+                    lines.append(f"  ! {cf.get('message')}")
 
             self.query_one("#daemon-info", Static).update("\n".join(lines))
             self._render_daemon_logs()
