@@ -751,6 +751,207 @@ class TelegramControllerTests(unittest.TestCase):
             code = run_cli(["--config", str(config_path), "telegram-controller"], stderr=stderr)
             self.assertEqual(code, EXIT_CONFIGURATION)
 
+    def test_telegram_controller_account_context_status_reporting(self) -> None:
+        """Verify TelegramController reports status, PID, schedule and history strictly isolated to its account."""
+        with TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            from daily_streak.accounts import AccountManager
+            from daily_streak.paths import get_data_dir
+            from daily_streak.models import RecipientResult, RecipientStatus
+
+            acc_mgr = AccountManager(base_dir=base_dir, default_config_path=base_dir / "config.json")
+            save_config(sample_config(base_dir), base_dir / "config.json")
+
+            acc_alpha = acc_mgr.create_account("acc-alpha", schedule_time="08:00")
+            acc_beta = acc_mgr.create_account("acc-beta", schedule_time="14:30")
+
+            data_dir_alpha = get_data_dir(acc_alpha.account_config, account_name="acc-alpha")
+            data_dir_beta = get_data_dir(acc_beta.account_config, account_name="acc-beta")
+            self.assertNotEqual(data_dir_alpha, data_dir_beta)
+
+            history_alpha = RunHistoryStore(data_dir_alpha)
+            summary_alpha = RunSummary()
+            summary_alpha.add_result(RecipientResult(recipient_name="AlphaUser", status=RecipientStatus.SUCCESS))
+            summary_alpha.started_at = datetime(2026, 10, 20, 8, 0, 0, tzinfo=timezone.utc)
+            summary_alpha.finished_at = datetime(2026, 10, 20, 8, 1, 0, tzinfo=timezone.utc)
+            history_alpha.append(summary_alpha)
+
+            history_beta = RunHistoryStore(data_dir_beta)
+            summary_beta = RunSummary()
+            summary_beta.add_result(RecipientResult(recipient_name="BetaUser", status=RecipientStatus.FAILED))
+            summary_beta.started_at = datetime(2026, 10, 20, 14, 30, 0, tzinfo=timezone.utc)
+            summary_beta.finished_at = datetime(2026, 10, 20, 14, 32, 0, tzinfo=timezone.utc)
+            history_beta.append(summary_beta)
+
+            daemon_alpha = MagicMock(spec=DaemonService)
+            daemon_alpha.get_status.return_value = {
+                "status": "Running",
+                "is_running": True,
+                "pid": 11111,
+                "backend": "process",
+                "next_run": "2026-10-21 08:00:00 +07",
+                "last_run": history_alpha.load(limit=1)[0],
+            }
+            daemon_alpha.is_paused.return_value = False
+
+            daemon_beta = MagicMock(spec=DaemonService)
+            daemon_beta.get_status.return_value = {
+                "status": "Stopped",
+                "is_running": False,
+                "pid": 22222,
+                "backend": "process",
+                "next_run": "2026-10-21 14:30:00 +07",
+                "last_run": history_beta.load(limit=1)[0],
+            }
+            daemon_beta.is_paused.return_value = False
+
+            ctrl_alpha = TelegramController(
+                acc_alpha.config_path,
+                account_name="acc-alpha",
+                daemon_service=daemon_alpha,
+            )
+            ctrl_beta = TelegramController(
+                acc_beta.config_path,
+                account_name="acc-beta",
+                daemon_service=daemon_beta,
+            )
+
+            # Alpha status check
+            update_alpha = FakeUpdate(chat_id="123456789")
+            asyncio.run(ctrl_alpha.handle_status(update_alpha, None))
+            text_alpha = update_alpha.message.reply_text.call_args[0][0]
+
+            self.assertIn("acc-alpha", text_alpha)
+            self.assertIn("11111", text_alpha)
+            self.assertIn("08:00", text_alpha)
+            self.assertNotIn("22222", text_alpha)
+            self.assertNotIn("14:30", text_alpha)
+            self.assertIn("thành công: 1", text_alpha)
+
+            # Beta status check
+            update_beta = FakeUpdate(chat_id="123456789")
+            asyncio.run(ctrl_beta.handle_status(update_beta, None))
+            text_beta = update_beta.message.reply_text.call_args[0][0]
+
+            self.assertIn("acc-beta", text_beta)
+            self.assertIn("Stopped", text_beta)
+            self.assertIn("14:30", text_beta)
+            self.assertNotIn("11111", text_beta)
+            self.assertNotIn("08:00", text_beta)
+            self.assertIn("thất bại: 1", text_beta)
+
+            # /last check for alpha and beta
+            last_up_alpha = FakeUpdate(chat_id="123456789")
+            asyncio.run(ctrl_alpha.handle_last(last_up_alpha, None))
+            last_text_alpha = last_up_alpha.message.reply_text.call_args[0][0]
+            self.assertIn("Thành công:* `1`", last_text_alpha)
+            self.assertIn("Thất bại:* `0`", last_text_alpha)
+
+            last_up_beta = FakeUpdate(chat_id="123456789")
+            asyncio.run(ctrl_beta.handle_last(last_up_beta, None))
+            last_text_beta = last_up_beta.message.reply_text.call_args[0][0]
+            self.assertIn("Thành công:* `0`", last_text_beta)
+            self.assertIn("Thất bại:* `1`", last_text_beta)
+
+    def test_telegram_controller_account_start_stop_isolation(self) -> None:
+        """Verify starting/stopping Account A does not invoke or affect Account B."""
+        with TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            from daily_streak.accounts import AccountManager
+
+            acc_mgr = AccountManager(base_dir=base_dir, default_config_path=base_dir / "config.json")
+            save_config(sample_config(base_dir), base_dir / "config.json")
+
+            acc_alpha = acc_mgr.create_account("acc-alpha")
+            acc_beta = acc_mgr.create_account("acc-beta")
+
+            daemon_alpha = MagicMock(spec=DaemonService)
+            daemon_alpha.get_status.side_effect = [
+                {"status": "Stopped", "is_running": False, "pid": None},
+                {"status": "Running", "is_running": True, "pid": 55555},
+                {"status": "Running", "is_running": True, "pid": 55555},
+            ]
+            daemon_alpha.start.return_value = 55555
+            daemon_alpha.stop.return_value = True
+
+            daemon_beta = MagicMock(spec=DaemonService)
+            daemon_beta.get_status.return_value = {
+                "status": "Stopped",
+                "is_running": False,
+                "pid": None,
+            }
+
+            ctrl_alpha = TelegramController(
+                acc_alpha.config_path,
+                account_name="acc-alpha",
+                daemon_service=daemon_alpha,
+            )
+            ctrl_beta = TelegramController(
+                acc_beta.config_path,
+                account_name="acc-beta",
+                daemon_service=daemon_beta,
+            )
+
+            # Start alpha
+            update = FakeUpdate()
+            asyncio.run(ctrl_alpha.handle_start(update, None))
+            daemon_alpha.start.assert_called_once()
+            daemon_beta.start.assert_not_called()
+
+            # Stop alpha
+            update = FakeUpdate()
+            asyncio.run(ctrl_alpha.handle_stop(update, None))
+            daemon_alpha.stop.assert_called_once()
+            daemon_beta.stop.assert_not_called()
+
+            # Pause beta
+            update = FakeUpdate()
+            asyncio.run(ctrl_beta.handle_pause(update, None))
+            daemon_beta.pause.assert_called_once_with(reason="telegram")
+            daemon_alpha.pause.assert_not_called()
+
+    def test_telegram_controller_daemon_service_factory_wires_account(self) -> None:
+        """Verify default create_daemon_service instantiates manager targeting the right account."""
+        with TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            from daily_streak.accounts import AccountManager
+            from daily_streak.paths import get_data_dir
+
+            acc_mgr = AccountManager(base_dir=base_dir, default_config_path=base_dir / "config.json")
+            save_config(sample_config(base_dir), base_dir / "config.json")
+            acc = acc_mgr.create_account("acc-gamma")
+
+            controller = TelegramController(
+                acc.config_path,
+                account_name="acc-gamma",
+            )
+            self.assertEqual(controller.account_name, "acc-gamma")
+            service = controller.get_daemon_service()
+            self.assertIsInstance(service, ProcessDaemonManager)
+            self.assertEqual(service.account_name, "acc-gamma")
+            self.assertEqual(service._manager.account_name, "acc-gamma")
+
+            expected_data_dir = get_data_dir(acc.account_config, account_name="acc-gamma")
+            self.assertEqual(service._pause_store.data_dir, expected_data_dir)
+
+    def test_run_cli_telegram_controller_passes_account(self) -> None:
+        """Verify streak -a <account> telegram-controller forwards account_name."""
+        with TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            from daily_streak.accounts import AccountManager
+
+            acc_mgr = AccountManager(base_dir=base_dir, default_config_path=base_dir / "config.json")
+            save_config(sample_config(base_dir), base_dir / "config.json")
+            acc = acc_mgr.create_account("acc-cli")
+
+            with patch("daily_streak.cli._run_telegram_controller", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = 0
+                code = run_cli(["-a", "acc-cli", "telegram-controller"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                call_kwargs = mock_run.call_args[1]
+                self.assertEqual(call_kwargs.get("account_name"), "acc-cli")
+
 
 if __name__ == "__main__":
     unittest.main()

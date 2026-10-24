@@ -60,6 +60,7 @@ class TelegramController:
         self,
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         *,
+        account_name: str | None = None,
         config_loader: ConfigLoader = load_config,
         daemon_service: DaemonService | None = None,
         sender_factory: SenderFactory = create_sender,
@@ -77,6 +78,26 @@ class TelegramController:
         self._streak_refresher = streak_refresher
 
         initial_config = self.config_loader(self.config_path)
+
+        resolved_account = str(account_name).strip() if account_name else None
+        if not resolved_account:
+            raw_acc = initial_config.get("account_name") or initial_config.get("account")
+            if raw_acc:
+                resolved_account = str(raw_acc).strip()
+            elif (
+                len(self.config_path.parts) >= 3
+                and self.config_path.parts[-3] == "accounts"
+                and self.config_path.name.endswith(".json")
+            ):
+                resolved_account = self.config_path.parent.name
+            elif (
+                len(self.config_path.parts) >= 2
+                and self.config_path.parts[-2] == "accounts"
+                and self.config_path.suffix == ".json"
+            ):
+                resolved_account = self.config_path.stem
+        self.account_name = resolved_account if resolved_account and resolved_account != "default" else None
+
         raw_telegram = initial_config.get("telegram", {})
         telegram_cfg: Mapping[str, Any] = (
             raw_telegram if isinstance(raw_telegram, Mapping) else {}
@@ -85,11 +106,21 @@ class TelegramController:
         self.configured_chat_id = str(telegram_cfg.get("chat_id", "")).strip()
         self.commands_enabled = bool(telegram_cfg.get("commands_enabled", False))
 
+    def _get_config(self) -> dict[str, Any]:
+        cfg = dict(self.config_loader(self.config_path))
+        if self.account_name and "account_name" not in cfg:
+            cfg["account_name"] = self.account_name
+        return cfg
+
     def get_daemon_service(self) -> DaemonService:
         if self._daemon_service is not None:
             return self._daemon_service
-        config = self.config_loader(self.config_path)
-        return create_daemon_service(config, self.config_path)
+        config = self._get_config()
+        return create_daemon_service(
+            config,
+            self.config_path,
+            account_name=self.account_name,
+        )
 
     def is_authorized(self, update: Any) -> bool:
         """Verify update originated from the authorized chat_id."""
@@ -140,8 +171,8 @@ class TelegramController:
         if not self.is_authorized(update):
             return
 
-        config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(config)
+        config = self._get_config()
+        data_dir = get_data_dir(config, account_name=self.account_name)
         service = self.get_daemon_service()
         status_info = service.get_status()
 
@@ -175,9 +206,28 @@ class TelegramController:
         pid = status_info.get("pid")
         pid_text = f" (PID: {pid})" if pid else ""
         backend = status_info.get("backend", "process")
+        account_line = f"• *Tài khoản:* `{self.account_name}`\n" if self.account_name else ""
+
+        last_run = status_info.get("last_run")
+        if not last_run:
+            records = RunHistoryStore(data_dir).load(limit=1)
+            last_run = records[-1] if records else None
+
+        last_batch_line = ""
+        if isinstance(last_run, dict):
+            finished_at = (
+                last_run.get("finished_at")
+                or last_run.get("completed_at")
+                or last_run.get("started_at")
+            )
+            if finished_at:
+                success = last_run.get("success", last_run.get("success_count", 0))
+                failed = last_run.get("failed", last_run.get("failed_count", 0))
+                last_batch_line = f"\n• *Lượt gần nhất:* `{finished_at}` (thành công: {success}, thất bại: {failed})"
 
         text = (
             "📊 *Trạng thái Daily Streak Tool*\n\n"
+            f"{account_line}"
             f"• *Daemon scheduler:* `{daemon_status}`{pid_text}\n"
             f"• *Backend:* `{backend}`\n"
             f"• *Tiến độ hôm nay ({today_date}):* `{completed_recipients}/{total_recipients}` tài khoản hoàn tất\n"
@@ -185,6 +235,7 @@ class TelegramController:
             f"• *Lịch tự động:* `{schedule.time_text}` ({schedule.timezone})\n"
             f"• *Lượt tiếp theo:* `{status_info.get('next_run', 'N/A')}`\n"
             f"• *Khóa gửi (`send.lock`):* `{'Đang hoạt động' if send_lock_active else 'Không hoạt động'}`"
+            f"{last_batch_line}"
         )
         if update.message:
             await update.message.reply_text(text, parse_mode="Markdown")
@@ -194,8 +245,8 @@ class TelegramController:
         if not self.is_authorized(update):
             return
 
-        config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(config)
+        config = self._get_config()
+        data_dir = get_data_dir(config, account_name=self.account_name)
         history_store = RunHistoryStore(data_dir)
         records = history_store.load(limit=1)
 
@@ -245,7 +296,7 @@ class TelegramController:
         if not self.is_authorized(update):
             return
 
-        config = self.config_loader(self.config_path)
+        config = self._get_config()
         service = self.get_daemon_service()
         is_paused = service.is_paused()
 
@@ -368,8 +419,8 @@ class TelegramController:
         if not self.is_authorized(update):
             return
 
-        config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(config)
+        config = self._get_config()
+        data_dir = get_data_dir(config, account_name=self.account_name)
         from daily_streak.streak_reader import StreakCache
 
         cache = StreakCache(data_dir)
@@ -472,8 +523,8 @@ class TelegramController:
         if not self.is_authorized(update):
             return
 
-        config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(config)
+        config = self._get_config()
+        data_dir = get_data_dir(config, account_name=self.account_name)
         run_lock = RunLock(data_dir)
 
         if run_lock.is_active():
@@ -540,8 +591,8 @@ class TelegramController:
                 await query.answer("Đang trong quá trình làm mới streak, vui lòng đợi...", show_alert=True)
                 return
 
-            config = self.config_loader(self.config_path)
-            data_dir = get_data_dir(config)
+            config = self._get_config()
+            data_dir = get_data_dir(config, account_name=self.account_name)
             from daily_streak.lock import StreakLock
 
             streak_lock = StreakLock(data_dir)
@@ -583,8 +634,8 @@ class TelegramController:
             return
 
         # action == "run_confirm"
-        config = self.config_loader(self.config_path)
-        data_dir = get_data_dir(config)
+        config = self._get_config()
+        data_dir = get_data_dir(config, account_name=self.account_name)
         run_lock = RunLock(data_dir)
 
         if run_lock.is_active():
@@ -618,7 +669,7 @@ class TelegramController:
 
         async with self._sender_lock:
             try:
-                config = self.config_loader(self.config_path)
+                config = self._get_config()
                 sender = self.sender_factory(config)
                 summary: RunSummary = await sender.send_daily_links()
 
@@ -657,8 +708,8 @@ class TelegramController:
             return
 
         async with self._streaks_refresh_lock:
-            config = self.config_loader(self.config_path)
-            data_dir = get_data_dir(config)
+            config = self._get_config()
+            data_dir = get_data_dir(config, account_name=self.account_name)
             from daily_streak.streak_reader import StreakCache
             from daily_streak.recipient_actions import refresh_streaks
 
