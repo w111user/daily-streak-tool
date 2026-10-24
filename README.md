@@ -143,7 +143,7 @@ pip install -e '.[tui,telegram,desktop]'
 > - `desktop`: Cài đặt `plyer>=2.1.0` để hiển thị popup thông báo trên desktop.
 > - `windows`: Cài đặt `pywin32>=306` (chỉ dành cho hệ điều hành Windows).
 >
-> 💡 **Về `requirements.txt` và `pyproject.toml`:** Dự án tuân thủ chuẩn PEP 517/621, sử dụng `pyproject.toml` làm nguồn chân lý duy nhất (single source of truth) cho các dependency và extras. File `requirements.txt` được giữ lại nhằm đảm bảo tương thích ngược với các workflow cài đặt truyền thống (`pip install -r requirements.txt`). Khuyến nghị dùng `pip install -e '.[tui,telegram]'` cho các môi trường phát triển mã nguồn, hoặc `pip install "./daily_streak_tool-2.3.0-py3-none-any.whl[telegram]"` khi triển khai wheel trên server độc lập.
+> 💡 **Về `requirements.txt` và `pyproject.toml`:** Dự án tuân thủ chuẩn PEP 517/621, sử dụng `pyproject.toml` làm nguồn chân lý duy nhất (single source of truth) cho các dependency và extras. File `requirements.txt` được giữ lại nhằm đảm bảo tương thích ngược với các workflow cài đặt truyền thống (`pip install -r requirements.txt`). Khuyến nghị dùng `pip install -e '.[tui,telegram]'` cho các môi trường phát triển mã nguồn, hoặc `pip install "./daily_streak_tool-2.3.1-py3-none-any.whl[telegram]"` khi triển khai wheel trên server độc lập.
 
 
 ### Bước 3: Cài đặt trình duyệt cho Playwright (nếu không dùng Chrome hệ thống)
@@ -514,7 +514,7 @@ Khi cài đặt extra `telegram`, bạn có thể nhận thông báo tức thờ
 pip install -e '.[telegram]'
 
 # Hoặc khi cài đặt từ file wheel (.whl) trên máy chủ:
-pip install "./daily_streak_tool-2.3.0-py3-none-any.whl[telegram]"
+pip install "./daily_streak_tool-2.3.1-py3-none-any.whl[telegram]"
 ```
 
 ### Các sự kiện gửi thông báo:
