@@ -354,7 +354,14 @@ def run_cli(
                 _write_error(stderr, str(exc))
                 return EXIT_RUNTIME
         if arguments.command == "telegram-controller":
-            return asyncio.run(_run_telegram_controller(config_path, stderr, sender_factory))
+            return asyncio.run(
+                _run_telegram_controller(
+                    config_path,
+                    stderr,
+                    sender_factory,
+                    account_name=account_name,
+                )
+            )
     except FileNotFoundError as exc:
         _write_error(stderr, f"Configuration error: {exc}")
         return EXIT_CONFIGURATION
@@ -516,8 +523,11 @@ async def _run_telegram_controller(
     config_path: Path,
     stderr: TextIO,
     sender_factory: SenderFactory | None,
+    account_name: str | None = None,
 ) -> int:
     config = load_config(config_path)
+    if account_name and "account_name" not in config:
+        config["account_name"] = account_name
     raw_telegram = config.get("telegram", {})
     telegram_cfg: Mapping[str, Any] = (
         raw_telegram if isinstance(raw_telegram, Mapping) else {}
@@ -564,6 +574,7 @@ async def _run_telegram_controller(
 
     controller = TelegramController(
         config_path,
+        account_name=account_name,
         sender_factory=sender_factory or _default_sender_factory(),
     )
     await controller.run_forever()
