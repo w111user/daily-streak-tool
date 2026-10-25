@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
+import inspect
 import logging
 import re
 import time
@@ -13,6 +14,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+import unicodedata
+
 from daily_streak.browser import (
     DEFAULT_ACTION_TIMEOUT_MS,
     DEFAULT_CONTENT_READY_TIMEOUT_MS,
@@ -20,12 +23,15 @@ from daily_streak.browser import (
     DEFAULT_LOW_MEMORY_STABILIZATION_SECONDS,
     DEFAULT_NAVIGATION_TIMEOUT_MS,
     DEFAULT_PROBE_TIMEOUT_MS,
+    is_context_closed,
+    is_last_usable_page,
 )
 from daily_streak.navigation import (
     is_tiktok_http_url,
     navigate_to_messages,
     navigate_to_profile,
 )
+from daily_streak.state import normalize_username
 from daily_streak.tiktok import (
     handle_screen_time_popup,
     handle_sleep_hours_popup,
@@ -34,6 +40,63 @@ from daily_streak.tiktok import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_name_for_comparison(text: str) -> str:
+    """Normalize a display name or nickname for robust unicode and whitespace comparison.
+
+    Performs Unicode NFC normalization, collapses consecutive whitespace characters
+    (including non-breaking spaces and zero-width characters), strips leading/trailing
+    whitespace, and folds case.
+    """
+    if not text:
+        return ""
+    norm = unicodedata.normalize("NFC", str(text))
+    norm = re.sub(r"[\s\u00a0\u200b\u200e\u200f]+", " ", norm).strip()
+    return norm.casefold()
+
+
+def resolve_profile_by_user_id(
+    user_id: int,
+    *,
+    config: Mapping[str, Any] | None = None,
+    cookie_file: str | Path | None = None,
+    reader_factory: Callable[..., Any] | None = None,
+    http_client: Callable[..., Any] | None = None,
+) -> Any:
+    """Helper to query the verified first-party TikTok IM user profile endpoint."""
+    from pathlib import Path
+    from daily_streak.api_streak_reader import ApiStreakReader
+    from daily_streak.paths import get_data_dir
+    from daily_streak.streak_reader import StreakCache
+
+    cfg = dict(config or {})
+    target_cookie = cookie_file if cookie_file is not None else cfg.get("cookie_file", "cookies.json")
+    resolved_cookie: Path | None = None
+
+    if target_cookie:
+        p = Path(str(target_cookie)).expanduser()
+        if p.is_absolute():
+            resolved_cookie = p.resolve()
+        else:
+            cfg_path_val = cfg.get("_config_path") or cfg.get("config_path")
+            if cfg_path_val:
+                resolved_cookie = (Path(cfg_path_val).parent / p).resolve()
+            else:
+                resolved_cookie = p.resolve()
+
+    if reader_factory is not None:
+        reader = reader_factory(resolved_cookie)
+    else:
+        data_dir = get_data_dir(cfg)
+        cache = StreakCache(data_dir)
+        reader = ApiStreakReader(cache, cookie_file=resolved_cookie, http_client=http_client)
+
+    profiles = reader.resolve_uids_to_profiles([int(user_id)])
+    prof = profiles.get(int(user_id))
+    if prof and int(getattr(prof, "user_id", -1)) == int(user_id):
+        return prof
+    return None
 
 CONVERSATION_LIST_SELECTOR = "[data-e2e='dm-new-conversation-list']"
 CONVERSATION_ITEM_SELECTOR = "[data-e2e='dm-new-conversation-item']"
@@ -161,6 +224,10 @@ class AmbiguousConversationError(ValueError):
         )
 
 
+class RecipientIdentityMismatchError(ValueError):
+    """The opened DM conversation's header username does not match the expected recipient."""
+
+
 class _ReadinessProbeUnavailable(RuntimeError):
     """A bounded DOM snapshot timed out before the renderer could respond."""
 
@@ -249,6 +316,7 @@ class RecipientService:
         *,
         on_progress: Callable[[int, int], None] | None = None,
         force: bool = False,
+        profile_resolver: Callable[[int], Any] | None = None,
     ) -> list[dict[str, str]]:
         """Resolve selected display names from their existing DM chat headers.
 
@@ -316,14 +384,35 @@ class RecipientService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # A recipient-level failure is intentionally retained as a
-                # warning (including ambiguous display names) and the batch
-                # proceeds with the next selected recipient.
-                logger.warning(
-                    "Could not resolve TikTok username for %s: %s",
-                    display_name,
-                    exc,
-                )
+                recovered = False
+                uid = recipient.get("user_id") or recipient.get("uid")
+                if uid is not None and profile_resolver is not None:
+                    try:
+                        uid_int = int(uid)
+                        prof = profile_resolver(uid_int)
+                        if asyncio.iscoroutine(prof):
+                            prof = await prof
+                        if prof:
+                            p_uid = getattr(prof, "user_id", None) or (prof.get("user_id") if isinstance(prof, dict) else None)
+                            if p_uid is not None and int(p_uid) == uid_int:
+                                new_u = getattr(prof, "unique_id", None) or (prof.get("unique_id") if isinstance(prof, dict) else None)
+                                new_n = getattr(prof, "nick_name", None) or (prof.get("nick_name") if isinstance(prof, dict) else None)
+                                if new_u:
+                                    resolved.append({"name": str(new_n or display_name), "username": str(new_u).lstrip("@"), "user_id": uid_int})
+                                    recovered = True
+                                    logger.info("Resolved %s to @%s via verified user ID %s", display_name, new_u, uid_int)
+                    except Exception as res_err:
+                        logger.warning("Recovery via profile_resolver failed during username resolution for UID %s: %s", uid, res_err)
+
+                if not recovered:
+                    # A recipient-level failure is intentionally retained as a
+                    # warning (including ambiguous display names) and the batch
+                    # proceeds with the next selected recipient.
+                    logger.warning(
+                        "Could not resolve TikTok username for %s: %s",
+                        display_name,
+                        exc,
+                    )
             else:
                 resolved.append({"name": display_name, "username": username})
                 logger.info("Resolved %s to @%s", display_name, username)
@@ -379,6 +468,8 @@ class RecipientService:
                 context = getattr(current_page, "context", None)
                 if callable(context):
                     context = context()
+                if is_context_closed(context):
+                    raise TikTokDMReadinessError("Cannot recreate the page because its browser context is closed.")
                 if context is not None and callable(getattr(context, "new_page", None)):
                     logger.info("%s page was closed; creating a fresh page", caller)
                     current_page = await context.new_page()
@@ -405,13 +496,25 @@ class RecipientService:
                 context = getattr(current_page, "context", None)
                 if callable(context):
                     context = context()
-                if context is None or not callable(getattr(context, "new_page", None)):
-                    raise RuntimeError(
-                        "Cannot recreate the %s page because its browser context is unavailable."
+                if is_context_closed(context) or context is None or not callable(getattr(context, "new_page", None)):
+                    raise TikTokDMReadinessError(
+                        "Cannot recreate the %s page because its browser context is unavailable or closed."
                         % caller
                     )
-                await current_page.close()
-                current_page = await context.new_page()
+                # Create replacement page before closing old page to keep persistent context alive
+                old_page = current_page
+                try:
+                    replacement_page = await context.new_page()
+                except Exception as exc:
+                    logger.warning("Failed to create replacement page after renderer unresponsive: %s", exc)
+                    raise TikTokDMReadinessError(
+                        f"Failed to create replacement page for {caller}: {exc}"
+                    ) from exc
+
+                if not is_last_usable_page(context, old_page):
+                    with suppress(Exception):
+                        await old_page.close()
+                current_page = replacement_page
                 continue
             return current_page, readiness
 
@@ -490,7 +593,7 @@ class RecipientService:
         if is_empty:
             raise ValueError("TikTok reports an empty DM conversation list.")
 
-        normalized_display_name = display_name.casefold()
+        normalized_display_name = normalize_name_for_comparison(display_name)
         if reject_ambiguous:
             await self._click_unique_conversation_by_display_name(
                 page,
@@ -511,7 +614,7 @@ class RecipientService:
                 nickname_text = (
                     await nickname.inner_text(timeout=self.action_timeout_ms)
                 ).strip()
-                if nickname_text.casefold() == normalized_display_name:
+                if normalize_name_for_comparison(nickname_text) == normalized_display_name:
                     await item.click(timeout=self.action_timeout_ms)
                     await handle_screen_time_popup(
                         page,
@@ -551,6 +654,7 @@ class RecipientService:
         Playwright when the matched index is zero.
         """
 
+        norm_target = normalize_name_for_comparison(display_name)
         started_at = self._monotonic()
         for _ in range(max_scrolls):
             matches: list[Any] = []
@@ -561,7 +665,7 @@ class RecipientService:
                 nickname_text = (
                     await nickname.inner_text(timeout=self.action_timeout_ms)
                 ).strip()
-                if nickname_text.casefold() == normalized_display_name:
+                if normalize_name_for_comparison(nickname_text) == norm_target:
                     matches.append(item)
 
             if len(matches) > 1:
@@ -571,6 +675,9 @@ class RecipientService:
                 matched_item_count = await matched_row.count()
                 if matched_item_count > 1:
                     raise AmbiguousConversationError(display_name, matched_item_count)
+                if matched_item_count == 0:
+                    matched_row = matches[0]
+                    matched_item_count = 1
                 if matched_item_count == 1:
                     matched_display_name = (
                         await matched_row.locator(CONVERSATION_NICKNAME_SELECTOR).inner_text(
@@ -621,7 +728,14 @@ class RecipientService:
     def _exact_conversation_row_locator(page: Any, display_name: str) -> Any:
         """Return rows containing precisely the requested display-name element."""
 
-        exact_name = re.compile(rf"^{re.escape(display_name)}$", re.IGNORECASE)
+        norm_name = unicodedata.normalize("NFC", display_name).strip()
+        whitespace_sep = r"[\s\u00a0\u200b\u200e\u200f]+"
+        tokens = [re.escape(part) for part in re.split(whitespace_sep, norm_name) if part]
+        if tokens:
+            pattern = "^" + whitespace_sep.join(tokens) + "$"
+        else:
+            pattern = "^" + re.escape(norm_name) + "$"
+        exact_name = re.compile(pattern, re.IGNORECASE)
         matching_nicknames = page.locator(CONVERSATION_NICKNAME_SELECTOR).filter(
             has_text=exact_name
         )
@@ -812,6 +926,11 @@ class RecipientService:
         *,
         configured_display_name: str | None = None,
         reuse_existing_page: bool = False,
+        user_id: int | None = None,
+        profile_resolver: Callable[[int], Any] | None = None,
+        on_recipient_recovered: Callable[[str, str, int], None] | Callable[..., Any] | None = None,
+        verify_identity: bool = False,
+        **extra_kwargs: Any,
     ) -> tuple[Any, str]:
         """Open the DM conversation that corresponds to a known username.
 
@@ -820,6 +939,10 @@ class RecipientService:
         navigation merely to rediscover the same value.  Profile lookup stays
         as the compatibility fallback for older recipient records without a
         display name.
+
+        If the configured display name fails to match (e.g. recipient changed
+        their nickname or added emojis/stickers), recovery is attempted using
+        the verified numeric user ID via ``profile_resolver``.
         """
 
         display_name = (configured_display_name or "").strip()
@@ -828,16 +951,150 @@ class RecipientService:
                 "Selecting recipient %s using configured display name",
                 display_name,
             )
-            kwargs: dict[str, Any] = {"reject_ambiguous": True}
+            kwargs: dict[str, Any] = {
+                "reject_ambiguous": True,
+                "verify_identity": verify_identity,
+            }
             if reuse_existing_page:
                 kwargs["reuse_existing_page"] = True
-            return await self._select_recipient_by_display_name(
-                page,
-                display_name,
-                username,
-                notifier,
-                **kwargs,
-            )
+            try:
+                return await self._select_recipient_by_display_name(
+                    page,
+                    display_name,
+                    username,
+                    notifier,
+                    **kwargs,
+                )
+            except (ValueError, AmbiguousConversationError) as exc:
+                if user_id is None or profile_resolver is None:
+                    logger.warning(
+                        "Conversation for %r could not be selected (%s); no verified user_id/profile_resolver available",
+                        display_name,
+                        exc,
+                    )
+                    raise
+
+                logger.info(
+                    "Conversation for %r could not be selected (%s); attempting recovery with verified user ID %s",
+                    display_name,
+                    exc,
+                    user_id,
+                )
+                try:
+                    res = profile_resolver(int(user_id))
+                    if inspect.isawaitable(res):
+                        prof = await res
+                    else:
+                        prof = res
+                except Exception as res_exc:
+                    logger.warning("Profile resolution for user ID %s failed: %s", user_id, res_exc)
+                    raise exc
+
+                if prof is None:
+                    logger.warning("Profile resolver returned no profile for user ID %s", user_id)
+                    raise exc
+
+                prof_uid = getattr(prof, "user_id", None)
+                if prof_uid is None and isinstance(prof, dict):
+                    prof_uid = prof.get("user_id") or prof.get("uid")
+
+                try:
+                    if int(prof_uid) != int(user_id):
+                        logger.error(
+                            "Profile response user_id %s does not match requested user_id %s; rejecting recovery",
+                            prof_uid,
+                            user_id,
+                        )
+                        raise exc
+                except (ValueError, TypeError):
+                    logger.error("Invalid user_id in profile response: %s", prof_uid)
+                    raise exc
+
+                new_nick = getattr(prof, "nick_name", None)
+                new_username = getattr(prof, "unique_id", None)
+                if isinstance(prof, dict):
+                    new_nick = new_nick if new_nick is not None else (prof.get("nick_name") or prof.get("name"))
+                    new_username = new_username if new_username is not None else (prof.get("unique_id") or prof.get("username"))
+
+                new_nick = str(new_nick or "").strip()
+                new_username = str(new_username or "").strip().lstrip("@")
+
+                if not new_nick:
+                    logger.warning("Profile response contained empty nickname for user ID %s", user_id)
+                    raise exc
+
+                logger.info(
+                    "Verified recipient profile for UID %s: old_display_name=%r new_display_name=%r username=%r",
+                    user_id,
+                    display_name,
+                    new_nick,
+                    new_username or username,
+                )
+
+                if on_recipient_recovered is not None:
+                    try:
+                        res = on_recipient_recovered(
+                            new_nick,
+                            new_username or username,
+                            int(user_id),
+                        )
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as cb_exc:
+                        logger.warning("on_recipient_recovered callback error (non-fatal): %s", cb_exc)
+
+                # Reset scroll position of conversation list before retrying
+                try:
+                    conv_list = page.locator(CONVERSATION_LIST_SELECTOR).first
+                    await conv_list.evaluate("(element) => element.scrollTo(0, 0)")
+                except Exception:
+                    pass
+
+                # Retry conversation selection with refreshed display name
+                return await self._select_recipient_by_display_name(
+                    page,
+                    new_nick,
+                    new_username or username,
+                    notifier,
+                    reject_ambiguous=True,
+                    reuse_existing_page=reuse_existing_page,
+                    verify_identity=verify_identity,
+                )
+
+        if user_id is not None and profile_resolver is not None:
+            logger.info("Display name unavailable; resolving profile via verified user ID %s", user_id)
+            try:
+                res = profile_resolver(int(user_id))
+                if inspect.isawaitable(res):
+                    prof = await res
+                else:
+                    prof = res
+                if prof:
+                    prof_uid = getattr(prof, "user_id", None) or (prof.get("user_id") if isinstance(prof, dict) else None)
+                    if prof_uid and int(prof_uid) == int(user_id):
+                        new_nick = getattr(prof, "nick_name", None) or (prof.get("nick_name") if isinstance(prof, dict) else "")
+                        new_username = getattr(prof, "unique_id", None) or (prof.get("unique_id") if isinstance(prof, dict) else "")
+                        new_nick = str(new_nick or "").strip()
+                        new_username = str(new_username or "").strip().lstrip("@")
+                        if new_nick:
+                            if on_recipient_recovered is not None:
+                                with suppress(Exception):
+                                    cb_res = on_recipient_recovered(new_nick, new_username or username, int(user_id))
+                                    if inspect.isawaitable(cb_res):
+                                        await cb_res
+                            return await self._select_recipient_by_display_name(
+                                page,
+                                new_nick,
+                                new_username or username,
+                                notifier,
+                                reject_ambiguous=True,
+                                reuse_existing_page=reuse_existing_page,
+                                verify_identity=verify_identity,
+                            )
+            except AmbiguousConversationError:
+                raise
+            except Exception as exc:
+                logger.warning("UID profile lookup failed for %s (@%s): %s; falling back to web profile", user_id, username, exc)
 
         logger.info("Display name unavailable; falling back to TikTok profile lookup")
 
@@ -882,6 +1139,7 @@ class RecipientService:
         *,
         reject_ambiguous: bool,
         reuse_existing_page: bool = False,
+        verify_identity: bool = False,
     ) -> tuple[Any, str]:
         """Open a selected recipient's DM and wait for its message composer."""
 
@@ -941,6 +1199,18 @@ class RecipientService:
         )
         logger.debug("Editable elements after selecting %s: %s", username, editable_elements)
         await self.wait_for_message_input(page)
+
+        if verify_identity:
+            chat_username = await self.extract_username_from_chat(page)
+            if not chat_username:
+                raise RecipientIdentityMismatchError(
+                    f"Chat header username is missing or could not be read for {display_name} (expected @{username})"
+                )
+            if normalize_username(chat_username) != normalize_username(username):
+                raise RecipientIdentityMismatchError(
+                    f"Opened chat header @{chat_username} does not match expected @{username}"
+                )
+
         return page, display_name
 
     async def wait_for_message_input(self, page: Any) -> Any:

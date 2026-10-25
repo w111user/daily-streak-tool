@@ -168,6 +168,7 @@ def run_cli(
         cfg = load_config(path)
         if account_name and "account_name" not in cfg:
             cfg["account_name"] = account_name
+        cfg["_config_path"] = str(path.resolve())
         return cfg
 
     try:
@@ -221,7 +222,7 @@ def run_cli(
 
         if arguments.command == "send":
             config = _load_and_tag_config(config_path)
-            summary = asyncio.run(_run_send(config, bool(arguments.force), sender_factory))
+            summary = asyncio.run(_run_send(config, bool(arguments.force), sender_factory, config_path=config_path))
             _write_payload(summary_to_payload(summary), bool(arguments.json_output), stdout, _format_summary)
             if summary.setup_error:
                 return EXIT_RUNTIME
@@ -488,12 +489,19 @@ async def _run_send(
     config: Mapping[str, Any],
     force: bool,
     sender_factory: SenderFactory | None,
+    *,
+    config_path: Path | None = None,
 ) -> RunSummary:
     if sender_factory is None:
         from daily_streak.daemon import create_sender
 
         sender_factory = create_sender
-    sender = sender_factory(config)
+    from daily_streak.daemon import supports_kwarg
+
+    if config_path is not None and supports_kwarg(sender_factory, "config_path"):
+        sender = sender_factory(config, config_path=config_path)
+    else:
+        sender = sender_factory(config)
     return await sender.send_daily_links(force=force)
 
 

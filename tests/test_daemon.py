@@ -560,3 +560,45 @@ class DaemonTests(unittest.TestCase):
             status_after = manager.get_status()
             self.assertEqual(status_after["status"], "Stopped")
             self.assertIsNone(status_after["pid"])
+
+    def test_supports_kwarg_behavior(self) -> None:
+        """Verify supports_kwarg correctly detects explicit parameter vs **kwargs vs unsupported."""
+        from daily_streak.daemon import supports_kwarg
+
+        def f_with_explicit(config: dict, config_path: Path | None = None) -> None:
+            pass
+
+        def f_with_kwargs(config: dict, **kwargs: object) -> None:
+            pass
+
+        def f_legacy(config: dict) -> None:
+            pass
+
+        self.assertTrue(supports_kwarg(f_with_explicit, "config_path"))
+        self.assertTrue(supports_kwarg(f_with_kwargs, "config_path"))
+        self.assertFalse(supports_kwarg(f_legacy, "config_path"))
+        self.assertFalse(supports_kwarg("not_callable", "config_path"))
+
+    def test_daemon_runner_factory_does_not_mask_internal_type_error(self) -> None:
+        """P1: An internal TypeError inside factory must NOT cause fallback/retry calling factory twice."""
+        from daily_streak.daemon import DaemonRunner
+
+        call_count = 0
+
+        def buggy_factory(config: dict, config_path: Path | None = None) -> object:
+            nonlocal call_count
+            call_count += 1
+            # Simulate internal bug inside factory body
+            raise TypeError("internal bug inside factory")
+
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            runner = DaemonRunner(config_path, sender_factory=buggy_factory, config_loader=lambda p: {})
+
+            with self.assertRaises(TypeError) as cm:
+                asyncio.run(runner.run_once(check_pause=False))
+
+            self.assertIn("internal bug inside factory", str(cm.exception))
+            # Must only have been called ONCE; never retried without config_path!
+            self.assertEqual(call_count, 1)

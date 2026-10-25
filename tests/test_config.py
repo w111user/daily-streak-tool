@@ -44,3 +44,23 @@ class ConfigTests(unittest.TestCase):
             path.write_text("[]", encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_config(path)
+
+    def test_save_config_preserves_user_underscore_keys_and_strips_internal_config_path(self) -> None:
+        """P1: Avoid deleting arbitrary user config fields starting with _; strip only known internal keys."""
+        config = default_config()
+        config["_custom_user_field"] = "kept"
+        config["_my_comment"] = 42
+        config["_config_path"] = "/tmp/fake/config.json"
+
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "config.json"
+            save_config(config, path)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(raw["_custom_user_field"], "kept")
+        self.assertEqual(raw["_my_comment"], 42)
+        self.assertNotIn("_config_path", raw)
+
+
+if __name__ == "__main__":
+    unittest.main()

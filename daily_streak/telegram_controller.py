@@ -110,6 +110,7 @@ class TelegramController:
         cfg = dict(self.config_loader(self.config_path))
         if self.account_name and "account_name" not in cfg:
             cfg["account_name"] = self.account_name
+        cfg["_config_path"] = str(self.config_path.resolve())
         return cfg
 
     def get_daemon_service(self) -> DaemonService:
@@ -670,7 +671,12 @@ class TelegramController:
         async with self._sender_lock:
             try:
                 config = self._get_config()
-                sender = self.sender_factory(config)
+                from daily_streak.daemon import supports_kwarg
+
+                if supports_kwarg(self.sender_factory, "config_path"):
+                    sender = self.sender_factory(config, config_path=self.config_path)
+                else:
+                    sender = self.sender_factory(config)
                 summary: RunSummary = await sender.send_daily_links()
 
                 if summary.setup_error:
@@ -719,9 +725,11 @@ class TelegramController:
 
             try:
                 if self._streak_refresher is not None:
-                    try:
+                    from daily_streak.daemon import supports_kwarg
+
+                    if supports_kwarg(self._streak_refresher, "force"):
                         res = self._streak_refresher(config, recipients, force=True)
-                    except TypeError:
+                    else:
                         res = self._streak_refresher(config, recipients)
                     if asyncio.iscoroutine(res):
                         await res

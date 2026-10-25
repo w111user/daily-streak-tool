@@ -71,6 +71,9 @@ def load_config(
     return config
 
 
+INTERNAL_CONFIG_KEYS: frozenset[str] = frozenset({"_config_path"})
+
+
 def save_config(config: Mapping[str, Any], path: str | Path = DEFAULT_CONFIG_PATH) -> None:
     """Atomically write configuration in the legacy human-readable JSON format."""
 
@@ -84,8 +87,9 @@ def save_config(config: Mapping[str, Any], path: str | Path = DEFAULT_CONFIG_PAT
     )
     temporary_path = Path(temporary_name)
     try:
+        save_dict = {k: v for k, v in dict(config).items() if k not in INTERNAL_CONFIG_KEYS}
         with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            json.dump(dict(config), file, indent=2)
+            json.dump(save_dict, file, indent=2)
             file.write("\n")
             file.flush()
             os.fsync(file.fileno())

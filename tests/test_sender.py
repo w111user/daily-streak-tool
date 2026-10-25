@@ -4,7 +4,9 @@ import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
+from typing import Any
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +15,7 @@ from daily_streak.models import DeliveryStatus, RecipientResult, RecipientStatus
 from daily_streak.sender import (
     DeliveryConfirmedNotSentError,
     DeliveryUnconfirmedError,
+    RowSelectionState,
     TikTokSender,
     extract_video_identifier,
 )
@@ -90,7 +93,7 @@ class RecipientSelectionRecorder:
         return page, configured_display_name or ""
 
     async def extract_username_from_chat(self, page: object) -> str | None:
-        return None
+        return self.calls[-1][1] if self.calls else None
 
 
 class SenderPage:
@@ -578,13 +581,34 @@ class MockLocator:
 
 
 class MockShareElement:
-    def __init__(self, text: str = "", count_val: int = 1, visible: bool = True) -> None:
+    def __init__(
+        self,
+        text: str = "",
+        count_val: int = 1,
+        visible: bool = True,
+        attributes: dict[str, str] | None = None,
+        profile_links: list[str] | None = None,
+        sub_elements: dict[str, list["MockShareElement"]] | None = None,
+        auto_check_on_click: bool = True,
+    ) -> None:
         self.text = text
         self.count_val = count_val
         self.visible = visible
         self.clicked = False
         self.typed_values: list[str] = []
         self.filled_values: list[str] = []
+        self.attributes: dict[str, str] = dict(attributes or {})
+        self.auto_check_on_click = auto_check_on_click
+        self.sub_elements: dict[str, list[MockShareElement]] = dict(sub_elements or {})
+
+        if profile_links is not None:
+            self.profile_links = list(profile_links)
+        else:
+            self.profile_links = []
+            if text:
+                m = re.search(r"@([A-Za-z0-9_.-]+)", text)
+                if m:
+                    self.profile_links.append(f"/@{m.group(1)}")
 
     async def count(self) -> int:
         return self.count_val
@@ -597,6 +621,8 @@ class MockShareElement:
 
     async def click(self, timeout: int | None = None) -> None:
         self.clicked = True
+        if self.auto_check_on_click:
+            self.attributes["aria-checked"] = "true"
 
     async def type(self, value: str) -> None:
         self.typed_values.append(value)
@@ -607,21 +633,76 @@ class MockShareElement:
     async def inner_text(self, timeout: int | None = None) -> str:
         return self.text
 
+    async def get_attribute(self, attr: str) -> str | None:
+        return self.attributes.get(attr)
+
     @property
     def first(self) -> "MockShareElement":
         return self
 
+    def nth(self, idx: int) -> "MockShareElement":
+        return self
+
+    def locator(self, selector: str) -> Any:
+        for sel_key, elements in self.sub_elements.items():
+            if sel_key in selector:
+                if elements:
+                    container = MagicMock()
+                    container.count = AsyncMock(return_value=len(elements))
+                    container.nth = MagicMock(side_effect=lambda idx: elements[idx])
+                    container.first = elements[0]
+                    return container
+                return MockShareElement(count_val=0, visible=False)
+
+        if "a[href" in selector:
+            if self.profile_links:
+                link_els = [
+                    MockShareElement(attributes={"href": href})
+                    for href in self.profile_links
+                ]
+                container = MagicMock()
+                container.count = AsyncMock(return_value=len(link_els))
+                container.nth = MagicMock(side_effect=lambda idx: link_els[idx])
+                container.first = link_els[0]
+                container.evaluate_all = AsyncMock(return_value=self.profile_links)
+                return container
+            return MockShareElement(count_val=0, visible=False)
+
+        if any(k in selector for k in ("unique-id", "UniqueId", "UserSubTitle", "handle")):
+            if self.text and "@" in self.text:
+                m = re.search(r"@([A-Za-z0-9_.-]+)", self.text)
+                if m:
+                    handle_el = MockShareElement(text=f"@{m.group(1)}")
+                    container = MagicMock()
+                    container.count = AsyncMock(return_value=1)
+                    container.nth = MagicMock(return_value=handle_el)
+                    container.first = handle_el
+                    return container
+            return MockShareElement(count_val=0, visible=False)
+
+        return MockShareElement(count_val=0, visible=False)
+
 
 class MockVideoPage:
-    def __init__(self, friend_names: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        friend_names: list[str] | None = None,
+        friend_items: list[MockShareElement] | None = None,
+        chips: list[MockShareElement] | None = None,
+    ) -> None:
         self.goto_calls: list[str] = []
         self.share_btn = MockShareElement()
         self.search_nav_btn = MockShareElement()
         self.search_input = MockShareElement()
         self.send_btn = MockShareElement()
-        self.friend_items = [
-            MockShareElement(text=name) for name in (friend_names or ["Khoa Đức @khoa_memezlol"])
-        ]
+        if friend_items is not None:
+            self.friend_items = friend_items
+        else:
+            self.friend_items = [
+                MockShareElement(text=name, attributes={"aria-checked": "false"})
+                for name in (friend_names or ["Khoa Đức @khoa_memezlol"])
+            ]
+        self.chips: list[MockShareElement] = chips or []
         self.avatar_btns: dict[str, MockShareElement] = {}
 
     async def goto(self, url: str, wait_until: str = "commit", timeout: int | None = None) -> None:
@@ -634,11 +715,27 @@ class MockVideoPage:
             return self.search_nav_btn
         if "TUXTextInputCore-input" in selector or "Search" in selector:
             return self.search_input
-        if "DivUserItemContainer" in selector:
+        if "DivUserItemContainer" in selector or "share-user-item" in selector:
             containers = MagicMock()
             containers.count = AsyncMock(return_value=len(self.friend_items))
             containers.nth = MagicMock(side_effect=lambda idx: self.friend_items[idx])
             return containers
+        if "Chip" in selector or "Tag" in selector or "SelectedUser" in selector or "selected-user" in selector:
+            chips_container = MagicMock()
+            chips_container.count = AsyncMock(return_value=len(self.chips))
+            chips_container.nth = MagicMock(side_effect=lambda idx: self.chips[idx])
+            chips_container.first = self.chips[0] if self.chips else MockShareElement(count_val=0, visible=False)
+            return chips_container
+        if "aria-checked='true'" in selector or "aria-selected='true'" in selector:
+            checked = [
+                item for item in self.friend_items
+                if item.attributes.get("aria-checked") in ("true", "True", True)
+                or item.attributes.get("aria-selected") in ("true", "True", True)
+            ]
+            checked_container = MagicMock()
+            checked_container.count = AsyncMock(return_value=len(checked))
+            checked_container.nth = MagicMock(side_effect=lambda idx: checked[idx])
+            return checked_container
         if "StyledSendButton" in selector or "Send" in selector:
             return self.send_btn
         if "share-" in selector:
@@ -888,7 +985,328 @@ class NativeVideoCardSenderTests(unittest.TestCase):
 
             self.assertFalse(page.send_btn.clicked)
 
-    def test_share_video_card_send_button_failure_raises_not_sent(self) -> None:
+    def test_share_video_card_send_button_wait_failure_raises_not_sent(self) -> None:
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(["Khoa Đức @khoa_memezlol"])
+            page.send_btn.wait_for = AsyncMock(side_effect=RuntimeError("send btn not visible"))
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Khoa Đức", "username": "khoa_memezlol"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+
+    def test_chip_generic_data_e2e_is_not_accepted_as_username(self) -> None:
+        config: dict[str, object] = {"recipients": []}
+        sender = TikTokSender(config, FakeNotifier(), RecordingVideoPool())  # type: ignore[arg-type]
+        chip = MockShareElement(attributes={"data-e2e": "selected-user-chip"})
+        extracted = asyncio.run(sender._extract_chip_username(chip))
+        self.assertIsNone(extracted)
+
+    def test_chip_valid_data_e2e_prefix_accepted_as_identity_signal(self) -> None:
+        config: dict[str, object] = {"recipients": []}
+        sender = TikTokSender(config, FakeNotifier(), RecordingVideoPool())  # type: ignore[arg-type]
+        chip_share = MockShareElement(attributes={"data-e2e": "share-alice"})
+        self.assertEqual(asyncio.run(sender._extract_chip_username(chip_share)), "alice")
+
+        chip_prefix = MockShareElement(attributes={"data-e2e": "chip-alice"})
+        self.assertEqual(asyncio.run(sender._extract_chip_username(chip_prefix)), "alice")
+
+        chip_at = MockShareElement(attributes={"data-e2e": "chip-@alice"})
+        self.assertEqual(asyncio.run(sender._extract_chip_username(chip_at)), "alice")
+
+        chip_empty_suffix = MockShareElement(attributes={"data-e2e": "share-"})
+        self.assertIsNone(asyncio.run(sender._extract_chip_username(chip_empty_suffix)))
+
+        chip_malformed_suffix = MockShareElement(attributes={"data-e2e": "chip-alice!bad"})
+        self.assertIsNone(asyncio.run(sender._extract_chip_username(chip_malformed_suffix)))
+
+    def test_chip_conflicting_profile_link_and_explicit_attribute_rejected(self) -> None:
+        config: dict[str, object] = {"recipients": []}
+        sender = TikTokSender(config, FakeNotifier(), RecordingVideoPool())  # type: ignore[arg-type]
+        chip1 = MockShareElement(
+            profile_links=["/@alice"],
+            attributes={"data-username": "bob"},
+        )
+        self.assertIsNone(asyncio.run(sender._extract_chip_username(chip1)))
+
+        chip2 = MockShareElement(
+            profile_links=["/@alice"],
+            attributes={"data-e2e": "chip-bob"},
+        )
+        self.assertIsNone(asyncio.run(sender._extract_chip_username(chip2)))
+
+        chip3 = MockShareElement(
+            attributes={"data-username": "alice", "data-e2e": "chip-bob"},
+        )
+        self.assertIsNone(asyncio.run(sender._extract_chip_username(chip3)))
+
+    def test_chip_valid_unambiguous_selected_chip_passes(self) -> None:
+        config: dict[str, object] = {"recipients": []}
+        sender = TikTokSender(config, FakeNotifier(), RecordingVideoPool())  # type: ignore[arg-type]
+        chip = MockShareElement(
+            profile_links=["/@alice"],
+            attributes={"data-username": "alice", "data-e2e": "chip-alice"},
+        )
+        self.assertEqual(asyncio.run(sender._extract_chip_username(chip)), "alice")
+
+    def test_verify_share_recipient_selected_chip_generic_data_e2e_fails(self) -> None:
+        """P1: A generic data-e2e attribute on chip does not identify the user and fails before Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(text="Alice @alice")
+            chip = MockShareElement(attributes={"data-e2e": "selected-user-chip"})
+            page = MockVideoPage(friend_items=[row], chips=[chip])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_chip_mismatched_target_fails(self) -> None:
+        """P1: A chip identifying a different user fails verification before Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(text="Alice @alice")
+            chip = MockShareElement(attributes={"data-e2e": "chip-bob"})
+            page = MockVideoPage(friend_items=[row], chips=[chip])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_row_generic_data_e2e_user_item_not_accepted_as_username(self) -> None:
+        """P1: data-e2e='share-user-item' is a structural marker, not a username."""
+        config: dict[str, object] = {"recipients": []}
+        sender = TikTokSender(config, FakeNotifier(), RecordingVideoPool())  # type: ignore[arg-type]
+        row = MockShareElement(attributes={"data-e2e": "share-user-item"})
+        extracted = asyncio.run(sender._extract_share_row_usernames(row))
+        self.assertEqual(extracted, set())
+
+    def test_share_video_card_generic_data_e2e_user_item_aborts_without_send(self) -> None:
+        """P1: A row with only structural data-e2e='share-user-item' does not match and Send is not clicked."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(attributes={"data-e2e": "share-user-item"})
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "User Item", "username": "user-item"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_row_real_supported_share_avatar_identifier_accepted(self) -> None:
+        """P1: A real, supported share-avatar identifier identifies the recipient and clicks Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            avatar = MockShareElement(
+                attributes={"data-e2e": "share-alice", "class": "avatar"},
+            )
+            row = MockShareElement(
+                sub_elements={"avatar": [avatar]},
+                attributes={"aria-checked": "false"},
+                auto_check_on_click=True,
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(
+                    sender._share_video_card(
+                        page,
+                        {"name": "Alice", "username": "alice"},
+                        "https://www.tiktok.com/@user/video/7692053355551526162",
+                        "7692053355551526162",
+                    )
+                )
+            self.assertTrue(page.send_btn.clicked)
+
+    def test_share_row_arbitrary_row_level_marker_cannot_impersonate_identity(self) -> None:
+        """P1: Arbitrary row-level data-e2e marker cannot impersonate an identity."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                attributes={"data-e2e": "share-alice", "aria-checked": "false"},
+                auto_check_on_click=True,
+            )
+            self.assertEqual(asyncio.run(sender._extract_share_row_usernames(row)), set())
+
+            page = MockVideoPage(friend_items=[row])
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_row_generic_structural_marker_with_profile_link_does_not_conflict(self) -> None:
+        """P1: Structural marker share-user-item does not conflict with profile link /@alice."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                profile_links=["/@alice"],
+                attributes={"data-e2e": "share-user-item"},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            # Should match alice and click Send
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(
+                    sender._share_video_card(
+                        page,
+                        {"name": "Alice", "username": "alice"},
+                        "https://www.tiktok.com/@user/video/7692053355551526162",
+                        "7692053355551526162",
+                    )
+                )
+            self.assertTrue(page.send_btn.clicked)
+
+            # But should NOT match user-item
+            page2 = MockVideoPage(friend_items=[row])
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._share_video_card(
+                            page2,
+                            {"name": "User Item", "username": "user-item"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertFalse(page2.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_chip_valid_but_multiple_rows_selected_fails(self) -> None:
+        """P1: Valid Alice chip present, but both Alice and Bob rows are marked selected; fails closed without clicking Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row_alice = MockShareElement(text="Alice @alice", attributes={"aria-checked": "true"})
+            row_bob = MockShareElement(text="Bob @bob", attributes={"aria-checked": "true"})
+            chip_alice = MockShareElement(attributes={"data-e2e": "chip-alice"})
+            page = MockVideoPage(
+                friend_items=[row_alice, row_bob],
+                chips=[chip_alice],
+            )
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_valid_chip_with_zero_enumerable_rows_succeeds(self) -> None:
+        """P1: Genuinely exposes chips but no enumerable rows; exact verified chip succeeds."""
+        config: dict[str, object] = {"recipients": []}
+        sender = TikTokSender(config, FakeNotifier(), RecordingVideoPool())  # type: ignore[arg-type]
+        chip_alice = MockShareElement(attributes={"data-e2e": "chip-alice"})
+        item = MockShareElement()
+        page = MockVideoPage(friend_items=[], chips=[chip_alice])
+
+        verified = asyncio.run(sender._verify_share_recipient_selected(item, page, "alice"))
+        self.assertTrue(verified)
+
+    def test_share_video_card_send_button_click_failure_raises_unconfirmed(self) -> None:
         config: dict[str, object] = {"recipients": []}
         with TemporaryDirectory() as tmp_dir:
             sender = TikTokSender(
@@ -903,7 +1321,7 @@ class NativeVideoCardSenderTests(unittest.TestCase):
             page.send_btn.click = AsyncMock(side_effect=RuntimeError("send btn detached"))
 
             with patch("asyncio.sleep", new_callable=AsyncMock):
-                with self.assertRaises(DeliveryConfirmedNotSentError):
+                with self.assertRaises(DeliveryUnconfirmedError):
                     asyncio.run(
                         sender._share_video_card(
                             page,
@@ -912,6 +1330,1116 @@ class NativeVideoCardSenderTests(unittest.TestCase):
                             "7692053355551526162",
                         )
                     )
+
+    def test_share_video_card_does_not_match_suffix_username(self) -> None:
+        """P1: Target 'alice' must not match 'alice_backup'."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(["Alice Backup @alice_backup"])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("not found with exact verifiable username", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_video_card_does_not_match_prefix_username(self) -> None:
+        """P1: Target 'alice' must not match 'malice'."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(["Malice @malice"])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("not found with exact verifiable username", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_video_card_duplicate_exact_usernames_aborts_without_send(self) -> None:
+        """P1: Duplicate/ambiguous exact matches abort without clicking Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(["Alice @alice", "Alice Twin @alice"])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Ambiguous recipient", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_video_card_unique_exact_username_matches_and_clicks_send(self) -> None:
+        """P1: Unique exact username match proceeds and clicks Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(["Alice Backup @alice_backup", "Alice @alice", "Malice @malice"])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(
+                    sender._share_video_card(
+                        page,
+                        {"name": "Alice", "username": "alice"},
+                        "https://www.tiktok.com/@user/video/7692053355551526162",
+                        "7692053355551526162",
+                    )
+                )
+            self.assertTrue(page.send_btn.clicked)
+
+    def test_share_video_card_selection_verification_failure_aborts_without_send(self) -> None:
+        """P1: If selection verification fails, Send is never clicked."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(["Alice @alice"])
+            # Model DOM where selection could not be established
+            page.friend_items[0].auto_check_on_click = False
+            page.friend_items[0].attributes["aria-checked"] = "false"
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_row_authoritative_link_bob_with_conflicting_alice_field_rejected(self) -> None:
+        """P1: Row whose profile link is 'bob' but another DOM/text field is 'alice' must be rejected for target 'alice'."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice Cooper",
+                profile_links=["/@bob"],
+                sub_elements={"[data-e2e*='user-name']": [MockShareElement(text="alice")]},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice Cooper", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("not found with exact verifiable username", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_row_authoritative_link_alice_with_conflicting_bob_field_rejected(self) -> None:
+        """P1: Row whose profile link is 'alice' but unique-id field is 'bob' (reverse contradiction) must be rejected."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice @bob",
+                profile_links=["/@alice"],
+                sub_elements={"[data-e2e*='unique-id']": [MockShareElement(text="@bob")]},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("not found with exact verifiable username", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_row_conflicting_profile_links_rejected(self) -> None:
+        """P1: Row with conflicting profile links must be rejected."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice",
+                profile_links=["/@alice", "/@bob"],
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("not found with exact verifiable username", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_row_missing_authoritative_identity_rejected(self) -> None:
+        """P1: Row with missing authoritative identity evidence (only display name) must fail closed."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice Cooper",
+                profile_links=[],
+                sub_elements={},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice Cooper", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("not found with exact verifiable username", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_share_row_consistent_exact_username_matches_and_clicks_send(self) -> None:
+        """P1: Row with consistent exact username evidence matches and clicks Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice Cooper @alice",
+                profile_links=["/@alice"],
+                sub_elements={"[data-e2e*='unique-id']": [MockShareElement(text="@alice")]},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(
+                    sender._share_video_card(
+                        page,
+                        {"name": "Alice Cooper", "username": "alice"},
+                        "https://www.tiktok.com/@user/video/7692053355551526162",
+                        "7692053355551526162",
+                    )
+                )
+            self.assertTrue(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_chip_suffix_fails(self) -> None:
+        """P1: Target 'alice' with selected chip '@alice_backup' must fail without clicking Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(
+                friend_names=["Alice @alice"],
+                chips=[MockShareElement(text="@alice_backup")],
+            )
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_chip_display_name_substring_fails(self) -> None:
+        """P1: Target 'alice' with chip containing display name as substring must fail."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(
+                friend_names=["Alice @alice"],
+                chips=[MockShareElement(text="Alice Cooper")],  # display name, no verified username
+            )
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice Cooper", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_multiple_chips_fails(self) -> None:
+        """P1: Target 'alice' with multiple recipients selected in chips must fail."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(
+                friend_names=["Alice @alice"],
+                chips=[MockShareElement(text="@alice"), MockShareElement(text="@bob")],
+            )
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_exact_single_chip_succeeds(self) -> None:
+        """P1: Target 'alice' with exact single chip '@alice' succeeds and clicks Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            page = MockVideoPage(
+                friend_names=["Alice @alice"],
+                chips=[MockShareElement(text="@alice")],
+            )
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(
+                    sender._share_video_card(
+                        page,
+                        {"name": "Alice", "username": "alice"},
+                        "https://www.tiktok.com/@user/video/7692053355551526162",
+                        "7692053355551526162",
+                    )
+                )
+            self.assertTrue(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_missing_or_ambiguous_state_fails(self) -> None:
+        """P1: Missing or ambiguous selection state fails closed before Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=False,
+                attributes={},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_two_selected_rows_fails(self) -> None:
+        """P1: Two selected recipient rows are rejected before Send is clicked."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row_alice = MockShareElement(
+                text="Alice @alice",
+                attributes={"aria-checked": "true"},
+            )
+            row_bob = MockShareElement(
+                text="Bob @bob",
+                attributes={"aria-checked": "true"},
+            )
+            page = MockVideoPage(friend_items=[row_alice, row_bob])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_unselected_class_alone_fails(self) -> None:
+        """P1: An 'unselected' class alone does not count as selected and fails before Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=False,
+                attributes={"class": "user-item unselected"},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_exception_during_inspection_fails_closed(self) -> None:
+        """P1: An exception while inspecting other selected recipients fails closed without clicking Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row_alice = MockShareElement(
+                text="Alice @alice",
+                attributes={"aria-checked": "true"},
+            )
+            row_broken = MockShareElement(
+                text="Bob @bob",
+            )
+            row_broken.get_attribute = AsyncMock(side_effect=RuntimeError("DOM node detached during inspection"))
+            page = MockVideoPage(friend_items=[row_alice, row_broken])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_chip_with_conflicting_identities_fails(self) -> None:
+        """P1: A selected chip with conflicting authoritative usernames is rejected before Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            conflicting_chip = MockShareElement(
+                text="Alice @alice",
+                profile_links=["/@alice", "/@bob"],
+            )
+            page = MockVideoPage(
+                friend_names=["Alice @alice"],
+                chips=[conflicting_chip],
+            )
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_valid_exact_recipient_succeeds(self) -> None:
+        """P1: A valid, exactly selected recipient row succeeds and clicks Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row_alice = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=True,
+                attributes={"aria-checked": "false"},
+            )
+            row_bob = MockShareElement(
+                text="Bob @bob",
+                auto_check_on_click=False,
+                attributes={"aria-checked": "false"},
+            )
+            page = MockVideoPage(friend_items=[row_alice, row_bob])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(
+                    sender._share_video_card(
+                        page,
+                        {"name": "Alice", "username": "alice"},
+                        "https://www.tiktok.com/@user/video/7692053355551526162",
+                        "7692053355551526162",
+                    )
+                )
+            self.assertTrue(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_unknown_row_state_fails_before_send(self) -> None:
+        """P1: Alice is explicitly selected, but Bob has unknown selection state -> fails before Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row_alice = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=True,
+                attributes={"aria-checked": "false"},
+            )
+            # Bob has no readable selection state (empty attributes)
+            row_bob = MockShareElement(
+                text="Bob @bob",
+                auto_check_on_click=False,
+                attributes={},
+            )
+            page = MockVideoPage(friend_items=[row_alice, row_bob])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_verify_share_recipient_selected_alice_selected_and_bob_explicitly_unselected_succeeds(self) -> None:
+        """P1: Alice is selected, and Bob is explicitly unselected -> succeeds and clicks Send."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row_alice = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=True,
+                attributes={"aria-checked": "false"},
+            )
+            row_bob = MockShareElement(
+                text="Bob @bob",
+                auto_check_on_click=False,
+                attributes={"aria-checked": "false"},
+            )
+            page = MockVideoPage(friend_items=[row_alice, row_bob])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(
+                    sender._share_video_card(
+                        page,
+                        {"name": "Alice", "username": "alice"},
+                        "https://www.tiktok.com/@user/video/7692053355551526162",
+                        "7692053355551526162",
+                    )
+                )
+            self.assertTrue(page.send_btn.clicked)
+
+    def test_is_row_element_selected_tri_state_behavior(self) -> None:
+        """P1: _is_row_element_selected returns SELECTED, UNSELECTED, or UNKNOWN, and raises on conflict."""
+        config: dict[str, object] = {"recipients": []}
+        sender = TikTokSender(config, FakeNotifier(), RecordingVideoPool())  # type: ignore[arg-type]
+
+        # Selected
+        el_sel = MockShareElement(attributes={"aria-checked": "true"})
+        self.assertEqual(
+            asyncio.run(sender._is_row_element_selected(el_sel)),
+            RowSelectionState.SELECTED,
+        )
+
+        # Explicitly unselected
+        el_unsel = MockShareElement(attributes={"aria-checked": "false"})
+        self.assertEqual(
+            asyncio.run(sender._is_row_element_selected(el_unsel)),
+            RowSelectionState.UNSELECTED,
+        )
+
+        # Negative class
+        el_neg_class = MockShareElement(attributes={"class": "item unselected"})
+        self.assertEqual(
+            asyncio.run(sender._is_row_element_selected(el_neg_class)),
+            RowSelectionState.UNSELECTED,
+        )
+
+        # Unknown (no readable state)
+        el_unknown = MockShareElement(attributes={})
+        self.assertEqual(
+            asyncio.run(sender._is_row_element_selected(el_unknown)),
+            RowSelectionState.UNKNOWN,
+        )
+
+        # Contradictory signals raise ValueError
+        el_conflict = MockShareElement(attributes={"aria-checked": "true", "aria-selected": "false"})
+        with self.assertRaises(ValueError):
+            asyncio.run(sender._is_row_element_selected(el_conflict))
+
+    def test_selection_conflict_aria_checked_true_and_aria_selected_false_fails_closed(self) -> None:
+        """P1: aria-checked='true' conflicting with aria-selected='false' must fail closed without Send click."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=False,
+                attributes={"aria-checked": "true", "aria-selected": "false"},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_selection_conflict_explicit_false_and_selected_class_fails_closed(self) -> None:
+        """P1: Explicit false attribute conflicting with a 'selected' class must fail closed without Send click."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=False,
+                attributes={"aria-checked": "false", "class": "user-item selected"},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("Could not verify selection state", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_identity_extraction_profile_link_inspection_fails_while_text_handle_available(self) -> None:
+        """P1: Failure reading authoritative profile link fails closed even when text handle is present."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(text="Alice @alice")
+            orig_locator = row.locator
+
+            def broken_link_locator(sel: str) -> Any:
+                if "a[href" in sel:
+                    broken_links = MagicMock()
+                    broken_links.evaluate_all = AsyncMock(side_effect=RuntimeError("Profile link inspection error"))
+                    broken_links.count = AsyncMock(side_effect=RuntimeError("Profile link inspection error"))
+                    return broken_links
+                return orig_locator(sel)
+
+            row.locator = broken_link_locator  # type: ignore[method-assign]
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("not found with exact verifiable username", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_identity_extraction_row_signal_fails_while_another_signal_matches_target(self) -> None:
+        """P1: Failure reading one identity signal fails closed even if another signal appears to match."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice @alice",
+                profile_links=["/@alice"],
+            )
+            orig_locator = row.locator
+
+            def broken_unique_id_locator(sel: str) -> Any:
+                if "unique-id" in sel:
+                    broken_el = MagicMock()
+                    broken_el.count = AsyncMock(side_effect=RuntimeError("Unique-id DOM inspection failure"))
+                    return broken_el
+                return orig_locator(sel)
+
+            row.locator = broken_unique_id_locator  # type: ignore[method-assign]
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError) as cm:
+                    asyncio.run(
+                        sender._share_video_card(
+                            page,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "7692053355551526162",
+                        )
+                    )
+            self.assertIn("not found with exact verifiable username", str(cm.exception))
+            self.assertFalse(page.send_btn.clicked)
+
+    def test_valid_unambiguous_recipient_still_succeeds(self) -> None:
+        """P1: Valid, unambiguous recipient with consistent identity and selection succeeds."""
+        config: dict[str, object] = {"recipients": []}
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            row = MockShareElement(
+                text="Alice @alice",
+                profile_links=["/@alice"],
+                auto_check_on_click=True,
+                attributes={"aria-checked": "false"},
+            )
+            page = MockVideoPage(friend_items=[row])
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(
+                    sender._share_video_card(
+                        page,
+                        {"name": "Alice", "username": "alice"},
+                        "https://www.tiktok.com/@user/video/7692053355551526162",
+                        "7692053355551526162",
+                    )
+                )
+            self.assertTrue(page.send_btn.clicked)
+
+    def test_post_click_exception_in_share_video_card_returns_unconfirmed_without_fallback_or_retry(self) -> None:
+        """P1: Non-cancellation exception after Send click in _share_video_card() must result in UNCONFIRMED, no retry, no raw-URL fallback."""
+        config: dict[str, Any] = {
+            "tiktok": {"recipient_retries": 2, "message_delay_seconds": [0, 0]},
+            "recipients": [{"name": "Alice", "username": "alice"}],
+        }
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender.allow_raw_url_fallback = True  # Explicitly enable fallback
+            sender._send_raw_url_flow = AsyncMock()
+
+            video_page = MockVideoPage(["Alice @alice"])
+
+            dm_page = MockDeliveryPage(evaluate_result={"verified": True})
+            sender.recipient_service.select_recipient_for_username_with_page = AsyncMock(return_value=(dm_page, "Alice"))
+            sender._active_dm_page = dm_page
+            sender._handle_tiktok_interruptions = AsyncMock()
+            sender._verify_chat_header_identity = AsyncMock()
+            sender._count_chat_items = AsyncMock(return_value=0)
+            sender._wait_for_delivery_evidence = AsyncMock()
+
+            context = MagicMock()
+            context.is_closed = lambda: False
+            context.new_page = AsyncMock(return_value=video_page)
+
+            orig_sleep = asyncio.sleep
+
+            async def failing_sleep(duration: float) -> None:
+                if video_page.send_btn.clicked:
+                    raise RuntimeError("Post-click crash in _share_video_card")
+                await orig_sleep(0)
+
+            with patch("asyncio.sleep", side_effect=failing_sleep):
+                result = asyncio.run(
+                    sender._send_recipient_with_retries(context, config["recipients"][0])
+                )
+
+            self.assertTrue(video_page.send_btn.clicked)
+            self.assertEqual(result.status, RecipientStatus.UNCONFIRMED)
+            self.assertEqual(result.delivery_status, DeliveryStatus.UNCONFIRMED)
+            self.assertEqual(result.attempts, 1)  # Did NOT retry
+            sender._send_raw_url_flow.assert_not_called()  # Did NOT fallback
+
+    def test_video_page_close_failure_after_send_does_not_trigger_resend(self) -> None:
+        """P1: video_page.close() failure after Send clicked does not cause retry."""
+        config: dict[str, Any] = {
+            "tiktok": {"recipient_retries": 1, "message_delay_seconds": [0, 0]},
+            "recipients": [{"name": "Alice", "username": "alice"}],
+        }
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            dm_page = MockDeliveryPage(evaluate_result={"verified": True})
+            sender.recipient_service.select_recipient_for_username_with_page = AsyncMock(return_value=(dm_page, "Alice"))
+            sender._active_dm_page = dm_page
+            sender._handle_tiktok_interruptions = AsyncMock()
+            sender._verify_chat_header_identity = AsyncMock()
+            sender._count_chat_items = AsyncMock(return_value=0)
+            sender._wait_for_delivery_evidence = AsyncMock()
+
+            # Mock context
+            video_page = MockVideoPage(["Alice @alice"])
+            video_page.close = AsyncMock(side_effect=RuntimeError("close failed on video page"))
+
+            async def mock_new_page() -> Any:
+                return video_page
+
+            ctx = MagicMock()
+            ctx.is_closed = lambda: False
+            ctx.new_page = mock_new_page
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                res = asyncio.run(sender._send_recipient_with_retries(ctx, config["recipients"][0]))
+
+            # Send button was clicked once
+            self.assertTrue(video_page.send_btn.clicked)
+            # Result is verified SUCCESS, attempts == 1 (no duplicate attempt!)
+            self.assertEqual(res.status, RecipientStatus.SUCCESS)
+            self.assertEqual(res.delivery_status, DeliveryStatus.VERIFIED)
+            self.assertEqual(res.attempts, 1)
+
+    def test_post_verification_popup_handling_failure_does_not_resend(self) -> None:
+        """P1: A post-verification popup handling exception does not resend a verified message."""
+        config: dict[str, Any] = {
+            "tiktok": {"recipient_retries": 1, "message_delay_seconds": [0, 0]},
+            "recipients": [{"name": "Alice", "username": "alice"}],
+        }
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            async def mock_popup_handler(p: Any) -> None:
+                if sender._wait_for_delivery_evidence.await_count > 0:
+                    raise RuntimeError("popup handler failed after verification")
+
+            dm_page = MockDeliveryPage(evaluate_result={"verified": True})
+            sender.recipient_service.select_recipient_for_username_with_page = AsyncMock(return_value=(dm_page, "Alice"))
+            sender._active_dm_page = dm_page
+            sender._handle_tiktok_interruptions = mock_popup_handler  # type: ignore[method-assign]
+            sender._verify_chat_header_identity = AsyncMock()
+            sender._count_chat_items = AsyncMock(return_value=0)
+            sender._wait_for_delivery_evidence = AsyncMock()
+
+            video_page = MockVideoPage(["Alice @alice"])
+            video_page.close = AsyncMock()
+
+            ctx = MagicMock()
+            ctx.is_closed = lambda: False
+            ctx.new_page = AsyncMock(return_value=video_page)
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                res = asyncio.run(sender._send_recipient_with_retries(ctx, config["recipients"][0]))
+
+            self.assertEqual(res.status, RecipientStatus.SUCCESS)
+            self.assertEqual(res.delivery_status, DeliveryStatus.VERIFIED)
+            self.assertEqual(res.attempts, 1)
+
+    def test_submission_failure_returns_unconfirmed_without_fallback(self) -> None:
+        """P1: A failure during Send button click returns UNCONFIRMED and does not invoke fallback."""
+        config: dict[str, Any] = {
+            "tiktok": {
+                "message_format": "native_video_card",
+                "allow_raw_url_fallback": True,
+                "recipient_retries": 1,
+            },
+            "recipients": [{"name": "Alice", "username": "alice"}],
+        }
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            dm_page = MockDeliveryPage(evaluate_result={"verified": True})
+            sender.recipient_service.select_recipient_for_username_with_page = AsyncMock(return_value=(dm_page, "Alice"))
+            sender._active_dm_page = dm_page
+            sender._handle_tiktok_interruptions = AsyncMock()
+            sender._verify_chat_header_identity = AsyncMock()
+            sender._count_chat_items = AsyncMock(return_value=0)
+            sender._send_raw_url_flow = AsyncMock()  # type: ignore[method-assign]
+
+            video_page = MockVideoPage(["Alice @alice"])
+            video_page.send_btn.click = AsyncMock(side_effect=RuntimeError("connection dropped during send click"))
+            video_page.close = AsyncMock()
+
+            ctx = MagicMock()
+            ctx.is_closed = lambda: False
+            ctx.new_page = AsyncMock(return_value=video_page)
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                res = asyncio.run(sender._send_recipient_with_retries(ctx, config["recipients"][0]))
+
+            self.assertEqual(res.status, RecipientStatus.UNCONFIRMED)
+            self.assertEqual(res.delivery_status, DeliveryStatus.UNCONFIRMED)
+            self.assertEqual(res.attempts, 1)
+            # Raw-URL fallback must NOT be called after possible submission!
+            sender._send_raw_url_flow.assert_not_awaited()
+
+    def test_verified_send_remains_successful_when_post_send_cleanup_fails(self) -> None:
+        """P1: A verified send remains successful even when post-send page close fails."""
+        config: dict[str, Any] = {
+            "tiktok": {"recipient_retries": 1, "message_delay_seconds": [0, 0]},
+            "recipients": [{"name": "Alice", "username": "alice"}],
+        }
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            dm_page = MockDeliveryPage(evaluate_result={"verified": True})
+            sender.recipient_service.select_recipient_for_username_with_page = AsyncMock(return_value=(dm_page, "Alice"))
+            sender._active_dm_page = dm_page
+            sender._handle_tiktok_interruptions = AsyncMock()
+            sender._verify_chat_header_identity = AsyncMock()
+            sender._count_chat_items = AsyncMock(return_value=0)
+            sender._wait_for_delivery_evidence = AsyncMock()
+
+            video_page = MockVideoPage(["Alice @alice"])
+            video_page.close = AsyncMock(side_effect=RuntimeError("browser crashed during close"))
+
+            ctx = MagicMock()
+            ctx.is_closed = lambda: False
+            ctx.new_page = AsyncMock(return_value=video_page)
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                res = asyncio.run(sender._send_recipient_with_retries(ctx, config["recipients"][0]))
+
+            self.assertEqual(res.status, RecipientStatus.SUCCESS)
+            self.assertEqual(res.delivery_status, DeliveryStatus.VERIFIED)
 
     def test_wait_for_delivery_evidence_verified_on_native_card(self) -> None:
         config: dict[str, object] = {
@@ -1234,6 +2762,9 @@ class PageReuseAndPacingTests(unittest.TestCase):
             pages_closed_during_selection: list[bool] = []
 
             class CustomRecipientService:
+                def __init__(self) -> None:
+                    self.current_username: str | None = None
+
                 async def select_recipient_for_username_with_page(
                     self,
                     page: Any,
@@ -1243,6 +2774,7 @@ class PageReuseAndPacingTests(unittest.TestCase):
                     configured_display_name: str | None = None,
                     reuse_existing_page: bool = False,
                 ) -> tuple[Any, str]:
+                    self.current_username = username
                     selection_calls.append(page)
                     pages_closed_during_selection.append(page.is_closed())
                     # Simulate page closing right after first recipient completes
@@ -1251,7 +2783,7 @@ class PageReuseAndPacingTests(unittest.TestCase):
                     return page, configured_display_name or username
 
                 async def extract_username_from_chat(self, page: Any) -> str | None:
-                    return None
+                    return self.current_username
 
             sender = TikTokSender(
                 config,
@@ -1293,6 +2825,9 @@ class PageReuseAndPacingTests(unittest.TestCase):
             selection_calls: list[Any] = []
 
             class CustomRecipientService:
+                def __init__(self) -> None:
+                    self.current_username: str | None = None
+
                 async def select_recipient_for_username_with_page(
                     self,
                     page: Any,
@@ -1302,11 +2837,12 @@ class PageReuseAndPacingTests(unittest.TestCase):
                     configured_display_name: str | None = None,
                     reuse_existing_page: bool = False,
                 ) -> tuple[Any, str]:
+                    self.current_username = username
                     selection_calls.append(page)
                     return page, configured_display_name or username
 
                 async def extract_username_from_chat(self, page: Any) -> str | None:
-                    return None
+                    return self.current_username
 
             sender = TikTokSender(
                 config,

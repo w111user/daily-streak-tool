@@ -335,9 +335,22 @@ class TuiController:
         if self.sender_factory is None:
             from daily_streak.daemon import create_sender
 
-            sender = create_sender(selected_config, on_recipient_result=self._on_recipient_result)
+            sender = create_sender(
+                selected_config,
+                on_recipient_result=self._on_recipient_result,
+                config_path=self.config_path,
+            )
         else:
-            sender = self.sender_factory(selected_config, self._on_recipient_result)
+            from daily_streak.daemon import supports_kwarg
+
+            if supports_kwarg(self.sender_factory, "config_path"):
+                sender = self.sender_factory(
+                    selected_config,
+                    self._on_recipient_result,
+                    config_path=self.config_path,
+                )
+            else:
+                sender = self.sender_factory(selected_config, self._on_recipient_result)
         summary = await sender.send_daily_links(force=force)
         self.last_summary = summary
         self.current_results = list(summary.results)
@@ -383,6 +396,7 @@ class TuiController:
 
         selected_config = dict(self.config)
         selected_config["recipients"] = self._selected_recipient_mappings()
+        selected_config["_config_path"] = str(self.config_path.resolve())
         return selected_config
 
     def _selected_recipient_mappings(self) -> list[dict[str, Any]]:

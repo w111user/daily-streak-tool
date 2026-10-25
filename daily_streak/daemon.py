@@ -6,6 +6,7 @@ import abc
 import asyncio
 from collections.abc import Callable
 from datetime import datetime, timezone
+import inspect
 import json
 import logging
 import os
@@ -40,10 +41,28 @@ class DaemonProcessError(RuntimeError):
     """Raised when daemon process control operations fail."""
 
 
+def supports_kwarg(func: Any, kwarg_name: str) -> bool:
+    """Check if a callable explicitly accepts a keyword argument or **kwargs."""
+    try:
+        sig = inspect.signature(func)
+        for param in sig.parameters.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+            if param.name == kwarg_name and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return True
+        return False
+    except (ValueError, TypeError):
+        return False
+
+
 def create_sender(
     config: Mapping[str, Any],
     *,
     on_recipient_result: Callable[[Any, RunSummary], None] | None = None,
+    config_path: str | Path | None = None,
     **kwargs: Any,
 ) -> Any:
     """Construct the standard shared sender without importing GUI code."""
@@ -52,11 +71,13 @@ def create_sender(
     from daily_streak.sender import TikTokSender
     from daily_streak.videos import VideoPool
 
+    resolved_config_path = config_path or config.get("_config_path") or config.get("config_path")
     return TikTokSender(
         config,
         Notifier(config),
         VideoPool(config),
         on_recipient_result=on_recipient_result,
+        config_path=resolved_config_path,
         **kwargs,
     )
 
@@ -122,7 +143,11 @@ class DaemonRunner:
                     )
                     return None
 
-            sender = self.sender_factory(config)
+            config["_config_path"] = str(self.config_path.resolve())
+            if supports_kwarg(self.sender_factory, "config_path"):
+                sender = self.sender_factory(config, config_path=self.config_path)
+            else:
+                sender = self.sender_factory(config)
             summary = await sender.send_daily_links()
             logger.info(
                 "%sSender run completed: %d success, %d failed, %d unconfirmed, %d skipped",

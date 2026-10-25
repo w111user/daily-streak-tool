@@ -65,6 +65,48 @@ class BrowserLaunchConfig:
     persistent_context: bool = True
 
 
+def is_context_closed(context: Any) -> bool:
+    """Check whether a browser context or its underlying browser is closed or disconnected."""
+    if context is None:
+        return True
+    is_closed = getattr(context, "is_closed", None)
+    if callable(is_closed):
+        try:
+            if is_closed():
+                return True
+        except Exception:
+            return True
+    browser = getattr(context, "browser", None)
+    if browser is not None:
+        is_connected = getattr(browser, "is_connected", None)
+        if callable(is_connected):
+            try:
+                if not is_connected():
+                    return True
+            except Exception:
+                return True
+    return False
+
+
+def is_last_usable_page(context: Any, page: Any) -> bool:
+    """Check whether page is the only remaining open page in context.
+
+    Closing the last open page in a Playwright persistent context destroys
+    the entire context and underlying browser.
+    """
+    if context is None or page is None:
+        return False
+    if is_context_closed(context):
+        return False
+    pages = getattr(context, "pages", None)
+    if pages is None:
+        return False
+    alive_pages = [p for p in pages if not getattr(p, "is_closed", lambda: False)()]
+    if len(alive_pages) <= 1 and (not alive_pages or alive_pages[0] is page):
+        return True
+    return False
+
+
 @dataclass
 class BrowserSession:
     """A browser/context pair with one owner for ordered asynchronous cleanup."""
@@ -77,9 +119,12 @@ class BrowserSession:
     async def get_page(self) -> Any:
         """Return one initial page after callers have injected cookies into the context."""
 
-        if self.page is None:
+        if self.page is None or getattr(self.page, "is_closed", lambda: False)():
+            if is_context_closed(self.context):
+                raise RuntimeError("Browser context is closed.")
             pages = getattr(self.context, "pages", ())
-            self.page = pages[0] if pages else await self.context.new_page()
+            alive_pages = [p for p in pages if not getattr(p, "is_closed", lambda: False)()]
+            self.page = alive_pages[0] if alive_pages else await self.context.new_page()
         return self.page
 
     async def load_cookies(self, cookie_file: str | Path) -> bool:
