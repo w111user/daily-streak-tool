@@ -322,6 +322,7 @@ class TikTokSender:
         config_path: str | Path | None = None,
         profile_resolver: Callable[[int], Any] | None = None,
         streak_cache: Any = None,
+        keep_page_on_pre_send_failure: bool | None = None,
     ) -> None:
         self.config = config
         self.notifier = notifier
@@ -338,6 +339,21 @@ class TikTokSender:
         self.allow_raw_url_fallback = bool(
             self.tiktok_config.get("allow_raw_url_fallback", False)
         )
+        self.keep_page_on_pre_send_failure = (
+            keep_page_on_pre_send_failure
+            if keep_page_on_pre_send_failure is not None
+            else bool(
+                self.tiktok_config.get("keep_page_on_pre_send_failure")
+                or self.tiktok_config.get("debug_keep_page_on_pre_send_failure")
+                or self.tiktok_config.get("debug_keep_browser_open")
+                or config.get("keep_page_on_pre_send_failure")
+                or config.get("debug_keep_page_on_pre_send_failure")
+                or config.get("debug_keep_browser_open")
+                or False
+            )
+        )
+        self._had_pre_send_failure: bool = False
+        self._last_recipient_selection_failure_reason: str | None = None
         raw_recipients = config.get("recipients", [])
         self.recipients: Sequence[Mapping[str, Any]] = (
             raw_recipients if isinstance(raw_recipients, list) else []
@@ -668,7 +684,12 @@ class TikTokSender:
                         dm_page=page,
                     )
                 finally:
-                    await session.close()
+                    if self.keep_page_on_pre_send_failure and getattr(self, "_had_pre_send_failure", False):
+                        logger.info(
+                            "Debug keep-open enabled: keeping browser session open after pre-send verification failure for inspection"
+                        )
+                    else:
+                        await session.close()
             await self._auto_refresh_streaks(summary)
             return summary
         finally:
@@ -796,12 +817,13 @@ class TikTokSender:
                 self._report_recipient_result(result, summary)
                 await self._sleep_between_messages()
         finally:
-            if created_dm_page_internally and self._active_dm_page is not None:
-                if not is_last_usable_page(context, self._active_dm_page):
-                    if hasattr(self._active_dm_page, "close") and not getattr(self._active_dm_page, "is_closed", lambda: False)():
-                        with suppress(Exception):
-                            await self._active_dm_page.close()
-            self._active_dm_page = None
+            if not (self.keep_page_on_pre_send_failure and getattr(self, "_had_pre_send_failure", False)):
+                if created_dm_page_internally and self._active_dm_page is not None:
+                    if not is_last_usable_page(context, self._active_dm_page):
+                        if hasattr(self._active_dm_page, "close") and not getattr(self._active_dm_page, "is_closed", lambda: False)():
+                            with suppress(Exception):
+                                await self._active_dm_page.close()
+                self._active_dm_page = None
 
         return self._finish_run(summary)
 
@@ -984,7 +1006,8 @@ class TikTokSender:
         try:
             await self._send_native_card_flow(context, recipient, selected_video, username=username, dm_page=target_dm_page)
         except DeliveryConfirmedNotSentError as exc:
-            if self.allow_raw_url_fallback:
+            self._had_pre_send_failure = True
+            if self.allow_raw_url_fallback and not self.keep_page_on_pre_send_failure:
                 logger.warning(
                     "native_video_card: Sharing failed before submit for %s (@%s): %s; falling back to raw_url",
                     configured_display_name or "recipient",
@@ -1094,17 +1117,31 @@ class TikTokSender:
                     ) from exc
             finally:
                 if hasattr(video_page, "close"):
-                    t_cleanup = time.monotonic()
-                    try:
-                        await video_page.close()
-                        logger.info("Timing: Post-send cleanup (closed video page) took %.2fs", time.monotonic() - t_cleanup)
-                    except Exception as exc:
-                        logger.warning(
-                            "Post-share video page close encountered an error for @%s (send_submitted=%s): %s",
+                    if self.keep_page_on_pre_send_failure and not send_submitted:
+                        self._had_pre_send_failure = True
+                        logger.info(
+                            "Debug keep-open enabled: leaving video page open after pre-send verification failure for inspection (@%s, send_clicked=False)",
                             username,
-                            send_submitted,
-                            exc,
                         )
+                    else:
+                        t_cleanup = time.monotonic()
+                        cleanup_type = "Post-submission" if send_submitted else "Pre-submission"
+                        try:
+                            await video_page.close()
+                            logger.info(
+                                "Timing: %s cleanup (closed video page) took %.2fs (send_clicked=%s)",
+                                cleanup_type,
+                                time.monotonic() - t_cleanup,
+                                send_submitted,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "%s video page close encountered an error for @%s (send_submitted=%s): %s",
+                                cleanup_type,
+                                username,
+                                send_submitted,
+                                exc,
+                            )
             logger.info("Timing: Video share operation took %.2fs for %s", time.monotonic() - t_video, username)
 
             # 3. Verify delivery in the recipient's DM
@@ -1484,7 +1521,7 @@ class TikTokSender:
         # 1. Explicit state attributes
         get_attr = getattr(item, "get_attribute", None)
         if callable(get_attr):
-            for attr in ("aria-checked", "aria-selected", "data-selected"):
+            for attr in ("aria-checked", "aria-selected", "data-selected", "data-checked"):
                 val = await item.get_attribute(attr)
                 if val in ("true", "True", True):
                     explicit_trues.append(f"{attr}=true")
@@ -1494,20 +1531,54 @@ class TikTokSender:
         # 2. Child checkbox elements
         locator = getattr(item, "locator", None)
         if callable(locator):
-            cb = item.locator("input[type='checkbox'], [role='checkbox'], [class*='Checkbox'], svg[class*='Check']").first
-            if hasattr(cb, "count") and callable(cb.count) and await cb.count() > 0:
-                if hasattr(cb, "is_checked") and callable(cb.is_checked):
-                    if await cb.is_checked():
-                        explicit_trues.append("cb.is_checked=true")
-                    else:
-                        explicit_falses.append("cb.is_checked=false")
-                get_cb_attr = getattr(cb, "get_attribute", None)
+            # 2a. Real HTML checkbox or radio input elements
+            # ONLY call is_checked() on actual input[type='checkbox'] or input[type='radio'] elements
+            input_cb = item.locator("input[type='checkbox'], input[type='radio']").first
+            if hasattr(input_cb, "count") and callable(input_cb.count) and await input_cb.count() > 0:
+                if hasattr(input_cb, "is_checked") and callable(input_cb.is_checked):
+                    try:
+                        if await input_cb.is_checked():
+                            explicit_trues.append("input_cb.is_checked=true")
+                        else:
+                            explicit_falses.append("input_cb.is_checked=false")
+                    except Exception as exc:
+                        logger.debug("Failed calling is_checked on input element: %s", exc)
+                get_cb_attr = getattr(input_cb, "get_attribute", None)
                 if callable(get_cb_attr):
-                    val = await cb.get_attribute("aria-checked")
-                    if val in ("true", "True", True):
-                        explicit_trues.append("cb[aria-checked]=true")
-                    elif val in ("false", "False", False):
-                        explicit_falses.append("cb[aria-checked]=false")
+                    for attr in ("aria-checked", "aria-selected", "data-checked", "data-selected"):
+                        val = await input_cb.get_attribute(attr)
+                        if val in ("true", "True", True):
+                            explicit_trues.append(f"input_cb[{attr}]=true")
+                        elif val in ("false", "False", False):
+                            explicit_falses.append(f"input_cb[{attr}]=false")
+
+            # 2b. Custom checkbox elements (role='checkbox', Checkbox class, svg check)
+            # NEVER call is_checked() on non-input custom elements; use explicit state attributes only.
+            custom_cb = item.locator(
+                "[role='checkbox'], [class*='Checkbox'], [class*='checkbox'], svg[class*='Check'], svg[class*='check']"
+            ).first
+            if hasattr(custom_cb, "count") and callable(custom_cb.count) and await custom_cb.count() > 0:
+                get_custom_attr = getattr(custom_cb, "get_attribute", None)
+                if callable(get_custom_attr):
+                    for attr in ("aria-checked", "aria-selected", "data-checked", "data-selected"):
+                        val = await custom_cb.get_attribute(attr)
+                        if val in ("true", "True", True):
+                            explicit_trues.append(f"custom_cb[{attr}]=true")
+                        elif val in ("false", "False", False):
+                            explicit_falses.append(f"custom_cb[{attr}]=false")
+
+                    cls_val = await custom_cb.get_attribute("class")
+                    if cls_val:
+                        cb_tokens = {t.strip() for t in cls_val.lower().split() if t.strip()}
+                        if cb_tokens & {"unselected", "not-selected", "unchecked", "not-checked"}:
+                            explicit_falses.append("custom_cb[class]=negative")
+                        elif any(
+                            t in {"selected", "checked", "is-selected", "is-checked"}
+                            or t.endswith("--selected")
+                            or t.endswith("--checked")
+                            for t in cb_tokens
+                        ):
+                            explicit_trues.append("custom_cb[class]=positive")
 
         # Check explicit conflicts between true and false signals
         if explicit_trues and explicit_falses:
@@ -1575,10 +1646,14 @@ class TikTokSender:
         """Verify that the intended recipient—and ONLY the intended recipient—is selected."""
         norm_target = normalize_username(target_username)
         if not norm_target:
+            self._last_recipient_selection_failure_reason = "target username is empty"
+            logger.warning("Recipient selection check failed: target username is empty")
             return False
 
         page_loc = getattr(page, "locator", None)
         if not callable(page_loc):
+            self._last_recipient_selection_failure_reason = "page locator is not callable"
+            logger.warning("Recipient selection check failed: page locator is not callable")
             return False
 
         chip_verified = False
@@ -1592,29 +1667,41 @@ class TikTokSender:
             chip_count = await chips.count() if hasattr(chips, "count") and callable(chips.count) else 0
             if chip_count > 0:
                 if chip_count != 1:
+                    reason = f"selected recipient chips count is {chip_count} (expected 1)"
+                    self._last_recipient_selection_failure_reason = reason
                     logger.warning(
-                        "Selected recipient chips count is %d (expected 1); rejecting",
-                        chip_count,
+                        "Recipient selection check failed for @%s: %s; rejecting",
+                        norm_target,
+                        reason,
                     )
                     return False
 
                 chip = chips.nth(0) if hasattr(chips, "nth") and callable(chips.nth) else chips.first
                 chip_user = await self._extract_chip_username(chip)
                 if not chip_user:
-                    logger.warning("Could not extract exact username from selected recipient chip; rejecting")
+                    reason = "could not extract exact username from selected recipient chip"
+                    self._last_recipient_selection_failure_reason = reason
+                    logger.warning(
+                        "Recipient selection check failed for @%s: %s; rejecting",
+                        norm_target,
+                        reason,
+                    )
                     return False
 
                 if chip_user != norm_target:
+                    reason = f"selected recipient chip @{chip_user} does not match expected @{norm_target}"
+                    self._last_recipient_selection_failure_reason = reason
                     logger.warning(
-                        "Selected recipient chip @%s does not match expected @%s; rejecting",
-                        chip_user,
-                        norm_target,
+                        "Recipient selection check failed: %s; rejecting",
+                        reason,
                     )
                     return False
 
                 chip_verified = True
         except Exception as exc:
-            logger.warning("Exception while inspecting modal chips: %s; failing closed", exc)
+            reason = f"exception while inspecting modal chips: {exc}"
+            self._last_recipient_selection_failure_reason = reason
+            logger.warning("Recipient selection check failed for @%s: %s; failing closed", norm_target, reason)
             return False
 
         # 2. Inspect recipient rows in the share modal (cross-checking rows even when a chip is found)
@@ -1630,8 +1717,11 @@ class TikTokSender:
             if count == 0:
                 if chip_verified:
                     # Genuinely exposes chips but no enumerable rows; accept verified chip
+                    self._last_recipient_selection_failure_reason = None
                     return True
-                logger.warning("Could not reliably enumerate recipient rows in share modal; failing closed")
+                reason = "could not reliably enumerate recipient rows in share modal and no verified chip present"
+                self._last_recipient_selection_failure_reason = reason
+                logger.warning("Recipient selection check failed for @%s: %s; failing closed", norm_target, reason)
                 return False
 
             selected_rows: list[tuple[Any, set[str]]] = []
@@ -1639,9 +1729,12 @@ class TikTokSender:
                 row_item = containers.nth(i)
                 state = await self._is_row_element_selected(row_item)
                 if state == RowSelectionState.UNKNOWN:
+                    reason = f"share modal row {i} has unknown selection state (not reliably determined)"
+                    self._last_recipient_selection_failure_reason = reason
                     logger.warning(
-                        "Share modal row %d has unknown selection state (not reliably determined); failing closed",
-                        i,
+                        "Recipient selection check failed for @%s: %s; failing closed",
+                        norm_target,
+                        reason,
                     )
                     return False
                 if state == RowSelectionState.SELECTED:
@@ -1652,25 +1745,33 @@ class TikTokSender:
 
             # Require exactly one selected recipient row
             if len(selected_rows) != 1:
+                reason = f"share modal has {len(selected_rows)} selected recipient rows (expected exactly 1)"
+                self._last_recipient_selection_failure_reason = reason
                 logger.warning(
-                    "Share modal has %d selected recipient rows (expected exactly 1); failing closed",
-                    len(selected_rows),
+                    "Recipient selection check failed for @%s: %s; failing closed",
+                    norm_target,
+                    reason,
                 )
                 return False
 
             _, row_usernames = selected_rows[0]
             # Require that row's authoritative username to exactly match the intended username
             if norm_target not in row_usernames:
+                reason = f"selected row authoritative username {row_usernames} does not match intended @{norm_target}"
+                self._last_recipient_selection_failure_reason = reason
                 logger.warning(
-                    "Selected row authoritative username %s does not match intended @%s",
-                    row_usernames,
+                    "Recipient selection check failed for @%s: %s",
                     norm_target,
+                    reason,
                 )
                 return False
 
+            self._last_recipient_selection_failure_reason = None
             return True
         except Exception as exc:
-            logger.warning("Exception while verifying recipient row selection states: %s; failing closed", exc)
+            reason = f"exception while verifying recipient row selection states: {exc}"
+            self._last_recipient_selection_failure_reason = reason
+            logger.warning("Recipient selection check failed for @%s: %s; failing closed", norm_target, reason)
             return False
 
     async def _share_video_card(
@@ -1784,12 +1885,21 @@ class TikTokSender:
                     matching_items.append((item, row_usernames))
 
             if len(matching_items) == 0:
+                logger.warning(
+                    "Recipient selection check failed for @%s: recipient not found with exact verifiable username in share list. Send button was NOT clicked.",
+                    username,
+                )
                 raise DeliveryConfirmedNotSentError(
-                    f"Recipient @{username} not found with exact verifiable username in TikTok share friends list."
+                    f"Recipient @{username} not found with exact verifiable username in TikTok share friends list; Send was not clicked."
                 )
             if len(matching_items) > 1:
+                logger.warning(
+                    "Recipient selection check failed for @%s: found %d ambiguous matches in share list. Send button was NOT clicked.",
+                    username,
+                    len(matching_items),
+                )
                 raise DeliveryConfirmedNotSentError(
-                    f"Ambiguous recipient @{username}: found {len(matching_items)} exact matches in share friends list."
+                    f"Ambiguous recipient @{username}: found {len(matching_items)} exact matches in share friends list; Send was not clicked."
                 )
 
             selected_item, _ = matching_items[0]
@@ -1803,14 +1913,25 @@ class TikTokSender:
                 target_display=configured_display_name or None,
             )
             if not verified_selection:
+                reason = getattr(self, "_last_recipient_selection_failure_reason", None) or "selection verification failed"
+                logger.warning(
+                    "Recipient selection check failed for @%s: %s. Send button was NOT clicked.",
+                    username,
+                    reason,
+                )
                 raise DeliveryConfirmedNotSentError(
-                    f"Could not verify selection state for recipient @{username} in share dialog."
+                    f"Could not verify selection state for recipient @{username} in share dialog: {reason}; Send was not clicked."
                 )
         except DeliveryConfirmedNotSentError:
             raise
         except Exception as exc:
+            logger.warning(
+                "Recipient selection check failed for @%s due to exception: %s. Send button was NOT clicked.",
+                username,
+                exc,
+            )
             raise DeliveryConfirmedNotSentError(
-                f"Failed to select recipient in share dialog: {exc}"
+                f"Failed to select recipient in share dialog: {exc}; Send was not clicked."
             ) from exc
 
         # 6. Click Send button
@@ -1820,8 +1941,13 @@ class TikTokSender:
             ).first
             await send_btn.wait_for(state="visible", timeout=self.action_timeout_ms)
         except Exception as exc:
+            logger.warning(
+                "Send button not found or not visible for @%s: %s. Send button was NOT clicked.",
+                username,
+                exc,
+            )
             raise DeliveryConfirmedNotSentError(
-                f"Send button not found or not visible in share dialog: {exc}"
+                f"Send button not found or not visible in share dialog: {exc}; Send was not clicked."
             ) from exc
 
         # 7. Click Send button - submission boundary

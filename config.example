@@ -22,7 +22,8 @@
     "persistent_context": true,
     "recipient_retries": 1,
     "message_format": "native_video_card",
-    "allow_raw_url_fallback": false
+    "allow_raw_url_fallback": false,
+    "keep_page_on_pre_send_failure": false
   },
   "runtime": {
     "run_lock_stale_seconds": 21600

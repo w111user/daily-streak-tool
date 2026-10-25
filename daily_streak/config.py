@@ -34,6 +34,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "low_memory_stabilization_seconds": 4.0,
         "persistent_context": True,
         "recipient_retries": 1,
+        "keep_page_on_pre_send_failure": False,
     },
     "recipients": [],
     "videos": [],

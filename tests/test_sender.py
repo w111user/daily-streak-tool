@@ -704,6 +704,10 @@ class MockVideoPage:
             ]
         self.chips: list[MockShareElement] = chips or []
         self.avatar_btns: dict[str, MockShareElement] = {}
+        self.closed: bool = False
+
+    async def close(self) -> None:
+        self.closed = True
 
     async def goto(self, url: str, wait_until: str = "commit", timeout: int | None = None) -> None:
         self.goto_calls.append(url)
@@ -2055,6 +2059,188 @@ class NativeVideoCardSenderTests(unittest.TestCase):
         el_conflict = MockShareElement(attributes={"aria-checked": "true", "aria-selected": "false"})
         with self.assertRaises(ValueError):
             asyncio.run(sender._is_row_element_selected(el_conflict))
+
+    def test_invalid_svg_checkbox_inspection_does_not_call_is_checked(self) -> None:
+        """Fix: is_checked() is NOT called on non-input custom checkbox or SVG elements.
+
+        Calling is_checked() on an SVG element raises Playwright RuntimeError:
+        'Locator.is_checked: Error: Not a checkbox or radio'. Inspection must use
+        explicit state attributes and avoid invoking is_checked().
+        """
+        config: dict[str, object] = {"recipients": []}
+        sender = TikTokSender(config, FakeNotifier(), RecordingVideoPool())  # type: ignore[arg-type]
+
+        # 1. Custom SVG element whose is_checked() raises RuntimeError
+        svg_el = MockShareElement(
+            attributes={"class": "tiktok-svg-CheckIcon", "aria-checked": "true"},
+        )
+        svg_el.is_checked = MagicMock(side_effect=RuntimeError("Locator.is_checked: Error: Not a checkbox or radio"))
+
+        row = MockShareElement(
+            sub_elements={"svg[class*='Check']": [svg_el]},
+            attributes={},
+        )
+        # Should evaluate to SELECTED via aria-checked without calling is_checked()
+        state = asyncio.run(sender._is_row_element_selected(row))
+        self.assertEqual(state, RowSelectionState.SELECTED)
+        svg_el.is_checked.assert_not_called()
+
+        # 2. SVG element with aria-checked='false' evaluates to UNSELECTED
+        svg_unsel = MockShareElement(
+            attributes={"class": "tiktok-svg-CheckIcon", "aria-checked": "false"},
+        )
+        svg_unsel.is_checked = MagicMock(side_effect=RuntimeError("Locator.is_checked: Error: Not a checkbox or radio"))
+        row_unsel = MockShareElement(
+            sub_elements={"svg[class*='Check']": [svg_unsel]},
+            attributes={},
+        )
+        state_unsel = asyncio.run(sender._is_row_element_selected(row_unsel))
+        self.assertEqual(state_unsel, RowSelectionState.UNSELECTED)
+        svg_unsel.is_checked.assert_not_called()
+
+        # 3. SVG element with missing state attributes evaluates to UNKNOWN (fails closed)
+        svg_missing = MockShareElement(
+            attributes={"class": "tiktok-svg-CheckIcon"},
+        )
+        svg_missing.is_checked = MagicMock(side_effect=RuntimeError("Locator.is_checked: Error: Not a checkbox or radio"))
+        row_missing = MockShareElement(
+            sub_elements={"svg[class*='Check']": [svg_missing]},
+            attributes={},
+        )
+        state_missing = asyncio.run(sender._is_row_element_selected(row_missing))
+        self.assertEqual(state_missing, RowSelectionState.UNKNOWN)
+        svg_missing.is_checked.assert_not_called()
+
+    def test_pre_send_failure_classification_is_confirmed_not_sent(self) -> None:
+        """Pre-send verification failure is classified as CONFIRMED_NOT_SENT, never SUCCESS."""
+        config: dict[str, object] = {
+            "recipients": [{"name": "Alice", "username": "alice"}],
+            "tiktok": {"recipient_retries": 1},
+        }
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+            )
+            sender._send_recipient_once = AsyncMock(
+                side_effect=DeliveryConfirmedNotSentError("Could not verify selection state")
+            )
+
+            context = MagicMock()
+            result = asyncio.run(
+                sender._send_recipient_with_retries(context, {"name": "Alice", "username": "alice"})
+            )
+
+            self.assertEqual(result.status, RecipientStatus.FAILED)
+            self.assertEqual(result.delivery_status, DeliveryStatus.CONFIRMED_NOT_SENT)
+            self.assertNotEqual(result.status, RecipientStatus.SUCCESS)
+            self.assertNotEqual(result.delivery_status, DeliveryStatus.VERIFIED)
+
+    def test_debug_keep_page_on_pre_send_failure_leaves_page_open(self) -> None:
+        """Opt-in debug setting keeps page open after a pre-send verification failure."""
+        config: dict[str, object] = {
+            "recipients": [{"name": "Alice", "username": "alice"}],
+            "tiktok": {"keep_page_on_pre_send_failure": True},
+        }
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+                keep_page_on_pre_send_failure=True,
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            sender._verify_chat_header_identity = AsyncMock()
+            sender._count_chat_items = AsyncMock(return_value=5)
+
+            mock_svc = MagicMock()
+            mock_svc.select_recipient_for_username_with_page = AsyncMock(return_value=(MagicMock(), "ready"))
+            sender.recipient_service = mock_svc
+
+            # Row that fails selection verification (auto_check_on_click=False, attributes={})
+            row = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=False,
+                attributes={},
+            )
+            video_page = MockVideoPage(friend_items=[row])
+            dm_page = MockVideoPage()
+
+            context = MagicMock()
+            context.is_closed = MagicMock(return_value=False)
+            context.new_page = AsyncMock(return_value=video_page)
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._send_native_card_flow(
+                            context,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "alice",
+                            dm_page=dm_page,
+                        )
+                    )
+
+            # Assert video_page was NOT closed because keep_page_on_pre_send_failure is enabled
+            self.assertFalse(video_page.closed)
+            self.assertFalse(video_page.send_btn.clicked)
+
+    def test_debug_keep_page_on_pre_send_failure_default_closes_page(self) -> None:
+        """Default production behavior (keep_page_on_pre_send_failure=False) closes page normally."""
+        config: dict[str, object] = {
+            "recipients": [{"name": "Alice", "username": "alice"}],
+            "tiktok": {"keep_page_on_pre_send_failure": False},
+        }
+        with TemporaryDirectory() as tmp_dir:
+            sender = TikTokSender(
+                config,
+                FakeNotifier(),
+                RecordingVideoPool(),  # type: ignore[arg-type]
+                state_store=DailyStateStore(Path(tmp_dir)),
+                history_store=RunHistoryStore(Path(tmp_dir)),
+                keep_page_on_pre_send_failure=False,
+            )
+            sender._handle_tiktok_interruptions = AsyncMock()
+            sender._verify_chat_header_identity = AsyncMock()
+            sender._count_chat_items = AsyncMock(return_value=5)
+
+            mock_svc = MagicMock()
+            mock_svc.select_recipient_for_username_with_page = AsyncMock(return_value=(MagicMock(), "ready"))
+            sender.recipient_service = mock_svc
+
+            row = MockShareElement(
+                text="Alice @alice",
+                auto_check_on_click=False,
+                attributes={},
+            )
+            video_page = MockVideoPage(friend_items=[row])
+            dm_page = MockVideoPage()
+
+            context = MagicMock()
+            context.is_closed = MagicMock(return_value=False)
+            context.new_page = AsyncMock(return_value=video_page)
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(DeliveryConfirmedNotSentError):
+                    asyncio.run(
+                        sender._send_native_card_flow(
+                            context,
+                            {"name": "Alice", "username": "alice"},
+                            "https://www.tiktok.com/@user/video/7692053355551526162",
+                            "alice",
+                            dm_page=dm_page,
+                        )
+                    )
+
+            # Assert video_page WAS closed under default behavior
+            self.assertTrue(video_page.closed)
+            self.assertFalse(video_page.send_btn.clicked)
 
     def test_selection_conflict_aria_checked_true_and_aria_selected_false_fails_closed(self) -> None:
         """P1: aria-checked='true' conflicting with aria-selected='false' must fail closed without Send click."""
