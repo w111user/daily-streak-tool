@@ -4,7 +4,7 @@
 [![Playwright](https://img.shields.io/badge/playwright-chromium-green.svg)](https://playwright.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
 [![Tests: 293 Passed](https://img.shields.io/badge/tests-293%20passed-brightgreen.svg)](tests/)
-
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/w111user/badge.svg)](https://hub.xerj.org/contributors/w111user)
 
 **Daily Streak Tool v2** là công cụ tự động hóa gửi video TikTok trực tiếp qua Direct Message (DM) theo lịch trình để duy trì chuỗi tương tác (streaks) với bạn bè.
 
